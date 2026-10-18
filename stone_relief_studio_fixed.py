@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Stone Relief Studio — редактор векторов и рельефов, версия 3.1.
+"""Stone Relief Studio — редактор векторов и рельефов, версия 3.2.
 
 Вся программа находится в этом файле. Другие файлы исходного кода не нужны.
 Запуск: python stone_relief_studio_fixed.py
 Установка библиотек:
 python -m pip install PySide6 numpy Pillow scipy trimesh pyvista pyvistaqt qtpy ezdxf rtree svgelements shapely "vtk>=9.5,<9.6"
 
-Версия 3.1: проверка STL перед записью, безопасная порционная запись с отменой,
-правильные диапазоны знаковых/беззнаковых карт высот, бюджет памяти истории.
+Версия 3.2: завершение лепки до сохранения и закрытия, сохранение исходной
+STL-сетки в проекте, проверка проекта до открытия, ускоренная проверка STL.
+Ноль рельефа соответствует верху основания; его толщину можно защитить при лепке.
+Проекты формата 4 читаются этой версией; поддерживается открытие форматов 2 и 3.
+STL не хранит обязательных единиц: при открытии выберите миллиметры.
+Проверка STL не обнаруживает произвольные самопересечения треугольников.
 Лимит буферов истории по умолчанию — 256 МБ; последний шаг сохраняется всегда.
 Независимые слои, управляющие линии и свободное редактирование сетки по X/Y
 пока не реализованы. Рельеф хранится как одна высота на точку XY.
@@ -274,6 +278,7 @@ def icon(name, accent=False):
 # ==================== stl_export ====================
 
 from dataclasses import dataclass
+from contextlib import ExitStack
 from pathlib import Path as FilePath
 import math
 import os
@@ -291,6 +296,7 @@ class ExportReport:
     triangles: int
     dimensions: tuple
     volume: float
+_STL_RAM_FACE_LIMIT = 200000
 _STL_RECORD = np.dtype([('normal', '<f4', 3), ('vertices', '<f4', (3, 3)), ('attribute', '<u2')])
 
 def _export_progress(callback, phase, current, total):
@@ -298,7 +304,7 @@ def _export_progress(callback, phase, current, total):
         callback(phase, current, total)
 
 def validate_stl_mesh(vertices, faces, progress=None, chunk_size=8192):
-    """Check indexed geometry; store edge counts on disk instead of large RAM arrays.
+    """Check indexed geometry; bound the RAM edge index and spill large meshes to disk.
 
     Detects invalid coordinates/indices, degenerate triangles, open/nonmanifold
     edges, inconsistent winding and nonpositive signed volume. It does not detect
@@ -323,35 +329,52 @@ def validate_stl_mesh(vertices, faces, progress=None, chunk_size=8192):
         raise ValueError('Модель должна иметь положительные размеры по X, Y и Z.')
     reference = low / 2 + high / 2
     volume_parts = []
-    with tempfile.TemporaryDirectory(prefix='stone_stl_check_') as folder:
-        database = sqlite3.connect(str(FilePath(folder) / 'edges.sqlite'))
-        try:
+    use_ram = len(faces) <= _STL_RAM_FACE_LIMIT and len(vertices) ** 2 <= np.iinfo(np.int64).max
+    with ExitStack() as resources:
+        if use_ram:
+            all_edges = np.empty((len(faces) * 3, 2), dtype=np.int64)
+        else:
+            folder = resources.enter_context(tempfile.TemporaryDirectory(prefix='stone_stl_check_'))
+            database = sqlite3.connect(str(FilePath(folder) / 'edges.sqlite'))
+            resources.callback(database.close)
             database.execute('PRAGMA journal_mode=OFF')
             database.execute('PRAGMA synchronous=OFF')
             database.execute('PRAGMA cache_size=-8192')
             database.execute('PRAGMA temp_store=FILE')
             database.execute('CREATE TABLE edges(a INTEGER, b INTEGER, n INTEGER, d INTEGER, PRIMARY KEY(a,b)) WITHOUT ROWID')
-            for start in range(0, len(faces), chunk_size):
-                block = faces[start:start + chunk_size]
-                if block.min() < 0 or block.max() >= len(vertices):
-                    raise ValueError('Треугольник ссылается на несуществующую вершину.')
-                triangle = np.asarray(vertices[block], dtype=np.float32).astype(np.float64)
-                normal = np.cross(triangle[:, 1] - triangle[:, 0], triangle[:, 2] - triangle[:, 0])
-                if np.any(np.linalg.norm(normal, axis=1) == 0):
-                    raise ValueError('Обнаружены вырожденные треугольники. Исправьте сетку перед экспортом.')
-                local = triangle - reference
-                volume_parts.append(float(np.einsum('ij,ij->i', local[:, 0], np.cross(local[:, 1], local[:, 2])).sum() / 6))
-                edges = np.concatenate((block[:, (0, 1)], block[:, (1, 2)], block[:, (2, 0)]))
-                database.executemany('INSERT INTO edges VALUES(?,?,1,?) ON CONFLICT(a,b) DO UPDATE SET n=n+1,d=d+excluded.d', ((int(min(a, b)), int(max(a, b)), 1 if a < b else -1) for a, b in edges))
-                _export_progress(progress, 'check', min(start + chunk_size, len(faces)), len(faces))
+        for start in range(0, len(faces), chunk_size):
+            block = faces[start:start + chunk_size]
+            if block.min() < 0 or block.max() >= len(vertices):
+                raise ValueError('Треугольник ссылается на несуществующую вершину.')
+            triangle = np.asarray(vertices[block], dtype=np.float32).astype(np.float64)
+            normal = np.cross(triangle[:, 1] - triangle[:, 0], triangle[:, 2] - triangle[:, 0])
+            if np.any(np.linalg.norm(normal, axis=1) == 0):
+                raise ValueError('Обнаружены вырожденные треугольники. Исправьте сетку перед экспортом.')
+            local = triangle - reference
+            volume_parts.append(float(np.einsum('ij,ij->i', local[:, 0], np.cross(local[:, 1], local[:, 2])).sum() / 6))
+            edges = np.concatenate((block[:, (0, 1)], block[:, (1, 2)], block[:, (2, 0)]))
+            if use_ram:
+                all_edges[3 * start:3 * (start + len(block))] = edges
+            else:
+                pairs, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0, return_inverse=True, return_counts=True)
+                directions = np.bincount(inverse, weights=np.where(edges[:, 0] < edges[:, 1], 1, -1)).astype(np.int64)
+                database.executemany('INSERT INTO edges VALUES(?,?,?,?) ON CONFLICT(a,b) DO UPDATE SET n=n+excluded.n,d=d+excluded.d', ((int(a), int(b), int(n), int(d)) for (a, b), n, d in zip(pairs, counts, directions)))
+            _export_progress(progress, 'check', min(start + chunk_size, len(faces)), len(faces))
+        if use_ram:
+            directions = np.where(all_edges[:, 0] < all_edges[:, 1], 1, -1)
+            keys = np.minimum(all_edges[:, 0], all_edges[:, 1]) * len(vertices) + np.maximum(all_edges[:, 0], all_edges[:, 1])
+            del all_edges
+            _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+            bad_edges = int(np.count_nonzero(counts != 2))
+            bad_directions = int(np.count_nonzero(np.bincount(inverse, weights=directions)))
+        else:
             bad_edges = database.execute('SELECT COUNT(*) FROM edges WHERE n!=2').fetchone()[0]
-            if bad_edges:
-                raise ValueError(f'Сетка незамкнута или содержит неманифолдные рёбра: {bad_edges}. Экспорт отменён. Исправьте сетку.')
             bad_directions = database.execute('SELECT COUNT(*) FROM edges WHERE d!=0').fetchone()[0]
-            if bad_directions:
-                raise ValueError(f'Нарушена ориентация граней у {bad_directions} рёбер. Исправьте нормали перед экспортом.')
-        finally:
-            database.close()
+        _export_progress(progress, 'check', len(faces), len(faces))
+        if bad_edges:
+            raise ValueError(f'Сетка незамкнута или содержит неманифолдные рёбра: {bad_edges}. Экспорт отменён. Исправьте сетку.')
+        if bad_directions:
+            raise ValueError(f'Нарушена ориентация граней у {bad_directions} рёбер. Исправьте нормали перед экспортом.')
     volume = math.fsum(volume_parts)
     if not math.isfinite(volume) or volume <= 0:
         raise ValueError('Объём модели нулевой или нормали направлены внутрь. Исправьте сетку перед экспортом.')
@@ -378,7 +401,7 @@ def _atomic_stl(path, report, batches, progress=None):
     try:
         with tempfile.NamedTemporaryFile(prefix='.' + path.name + '.', suffix='.tmp', dir=path.parent, delete=False) as stream:
             temporary = FilePath(stream.name)
-            stream.write(b'Stone Relief Studio 3.1; millimetres'.ljust(80, b' '))
+            stream.write(b'Stone Relief Studio 3.2; millimetres'.ljust(80, b' '))
             stream.write(struct.pack('<I', report.triangles))
             written = 0
             for triangles in batches:
@@ -454,6 +477,163 @@ def export_heightmap_stl(path, z, width, height, progress=None):
     volume = integral * (width / (nx - 1)) * (height / (ny - 1)) / 6
     report = ExportReport(count, (float(width), float(height), maximum), float(volume))
     return _atomic_stl(path, report, _heightfield_batches(z, xs, ys), progress)
+
+# ==================== project_storage ====================
+
+import io
+import json
+import math
+import os
+import tempfile
+import zipfile
+import numpy as np
+FORMAT, VERSION, EXT = ('StoneReliefStudioPro', 4, '.srelief')
+
+def _project_number(value, label, minimum=None, maximum=None, integer=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
+        raise ValueError(f'Некорректное число в проекте: {label}.')
+    if minimum is not None and value < minimum or (maximum is not None and value > maximum) or (integer and type(value) is not int):
+        raise ValueError(f'Значение вне допустимого диапазона: {label}.')
+
+def _project_point(value, size, label):
+    if not isinstance(value, (list, tuple)) or len(value) != size:
+        raise ValueError(f'Некорректные координаты: {label}.')
+    for coordinate in value:
+        _project_number(coordinate, label)
+
+def validate_project_payload(meta, arrays):
+    """Reject broken payloads before a GUI replaces the current document."""
+    if not isinstance(meta, dict) or not isinstance(arrays, dict):
+        raise ValueError('Повреждена структура проекта.')
+    settings = meta.get('settings', {})
+    if not isinstance(settings, dict):
+        raise ValueError('Повреждены настройки проекта.')
+    ranges = dict(w=(1e-06, 1000000000.0), h=(1e-06, 1000000000.0), base=(0.5, 200), depth=(0.5, 200), step=(0.05, 2), grid=(0.5, 500), blur=(0, 15), photo_fade=(0, 100), bright=(0, 100), contrast=(0, 100), az=(-180, 180), el=(3, 90), level=(0, 500), material=(0, 3))
+    integers = {'photo_fade', 'bright', 'contrast', 'az', 'el', 'material'}
+    for key, bounds in ranges.items():
+        if key in settings:
+            _project_number(settings[key], key, *bounds, integer=key in integers)
+    for key in ('invert', 'sun', 'fill'):
+        if key in settings and (not isinstance(settings[key], bool)):
+            raise ValueError(f'Некорректный переключатель: {key}.')
+    vectors = meta.get('vec', [])
+    if not isinstance(vectors, list):
+        raise ValueError('Повреждён список векторов.')
+    uids = set()
+    for vector in vectors:
+        if not isinstance(vector, dict) or not isinstance(vector.get('n'), list):
+            raise ValueError('Повреждён вектор.')
+        for node in vector['n']:
+            if not isinstance(node, (list, tuple)) or len(node) != 4:
+                raise ValueError('Повреждён узел вектора.')
+            _project_point(node[:2], 2, 'узел')
+            for handle in node[2:]:
+                if handle is not None:
+                    _project_point(handle, 2, 'ручка Безье')
+        _project_number(vector.get('g', 0), 'группа векторов', integer=True)
+        if 'c' in vector and (not isinstance(vector['c'], bool)):
+            raise ValueError('Повреждён признак замыкания вектора.')
+        uid = vector.get('uid')
+        if uid is not None:
+            if not isinstance(uid, str) or not uid or uid in uids:
+                raise ValueError('Некорректный или повторный идентификатор вектора.')
+            uids.add(uid)
+    controls = meta.get('ctrl', [])
+    if not isinstance(controls, list):
+        raise ValueError('Повреждён список управляющих точек.')
+    for point in controls:
+        _project_point(point, 3, 'управляющая точка')
+    workspace = settings.get('workspace', {})
+    if not isinstance(workspace, dict):
+        raise ValueError('Повреждены параметры рабочего пространства.')
+    for name in ('sweep', 'form'):
+        if not isinstance(workspace.get(name, {}), dict):
+            raise ValueError('Повреждены параметры инструмента: ' + name)
+    sweep, form = (workspace.get('sweep', {}), workspace.get('form', {}))
+    rails, sections = (sweep.get('rails', [None, None]), sweep.get('sections', []))
+    if not isinstance(rails, list) or len(rails) != 2 or (not isinstance(sections, list)) or any((x is not None and (not isinstance(x, str)) for x in rails)) or any((not isinstance(x, str) for x in sections)) or (sweep.get('z') is not None and (not isinstance(sweep['z'], str))):
+        raise ValueError('Повреждены ссылки на направляющие или сечения.')
+    positions = sweep.get('positions', {})
+    if not isinstance(positions, dict) or any((not isinstance(x, str) for x in positions)):
+        raise ValueError('Повреждены положения сечений.')
+    for value in positions.values():
+        _project_number(value, 'положение сечения', 0, 100)
+    for key in ('flip1', 'flip2', 'use_z', 'transition', 'scale_w', 'scale_end'):
+        if key in sweep and (not isinstance(sweep[key], bool)):
+            raise ValueError('Повреждён переключатель инструмента: ' + key)
+    for key in ('start', 'end'):
+        if key in sweep:
+            _project_number(sweep[key], key, -500, 500)
+    if sweep.get('mode', 'add') not in ('add', 'sub', 'high', 'low'):
+        raise ValueError('Неизвестный режим объединения сечений.')
+    form_ranges = dict(angle=(-90, 90), scale=(1, 50), kind=(0, 2), start=(-500, 500), limit=(0, 500), height=(0, 500), const=(-500, 500))
+    for key, bounds in form_ranges.items():
+        if key in form:
+            _project_number(form[key], key, *bounds, integer=key in ('angle', 'scale', 'kind'))
+    if form.get('kind', 0) not in (0, 1, 2):
+        raise ValueError('Неизвестная форма F12.')
+    if form.get('height_mode', 'free') not in ('free', 'limit', 'scale', 'const'):
+        raise ValueError('Неизвестный режим высоты F12.')
+    if form.get('combine', 'add') not in ('add', 'sub', 'high', 'low', 'zero_in', 'zero_out'):
+        raise ValueError('Неизвестный режим объединения F12.')
+    if set(arrays) - {'z', 'mesh_vertices', 'mesh_faces'}:
+        raise ValueError('Неизвестные данные геометрии проекта.')
+    for key, value in arrays.items():
+        if not isinstance(value, np.ndarray) or value.dtype.kind not in 'fiu' or (not np.isfinite(value).all()):
+            raise ValueError('Недопустимые значения геометрии: ' + key)
+    if 'z' in arrays:
+        z = arrays['z']
+        if z.ndim != 2 or min(z.shape) < 2 or max(abs(float(z.min())), abs(float(z.max()))) > float(np.finfo(np.float32).max):
+            raise ValueError('Некорректная карта высот проекта или превышен диапазон высот.')
+    has_vertices, has_faces = ('mesh_vertices' in arrays, 'mesh_faces' in arrays)
+    if has_vertices != has_faces or ('z' in arrays and has_vertices):
+        raise ValueError('Несогласованные данные сетки проекта.')
+    if has_vertices:
+        vertices, faces = (arrays['mesh_vertices'], arrays['mesh_faces'])
+        if vertices.ndim != 2 or vertices.shape[1] != 3 or (not len(vertices)) or (faces.ndim != 2) or (faces.shape[1] != 3) or (not len(faces)) or (faces.dtype.kind not in 'iu') or (faces.min() < 0) or (faces.max() >= len(vertices)):
+            raise ValueError('Повреждены вершины или индексы сетки проекта.')
+
+def pack_project(path, meta, photo=None, photo_name=None, arrays=None):
+    arrays = {key: np.asarray(value) for key, value in (arrays or {}).items()}
+    validate_project_payload(meta, arrays)
+    meta = dict(meta, format=FORMAT, version=VERSION, photo_file='photo.bin' if photo else None, arrays=sorted(arrays), photo_name=os.path.basename(photo_name or 'photo.png'))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.' + os.path.basename(path) + '.', suffix='.tmp', dir=os.path.dirname(os.path.abspath(path)), delete=False) as stream:
+            temporary = stream.name
+            with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr('project.json', json.dumps(meta, ensure_ascii=False, allow_nan=False))
+                if photo:
+                    archive.writestr(meta['photo_file'], photo)
+                if arrays:
+                    buffer = io.BytesIO()
+                    np.savez_compressed(buffer, **arrays)
+                    archive.writestr('arrays.npz', buffer.getvalue())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+
+def unpack_project(path):
+    with zipfile.ZipFile(path) as archive:
+        meta = json.loads(archive.read('project.json').decode('utf-8'))
+        if not isinstance(meta, dict) or meta.get('format') != FORMAT:
+            raise ValueError('Неизвестный формат проекта.')
+        version = meta.get('version')
+        if type(version) is not int or version < 2 or version > VERSION:
+            raise ValueError('Неподдерживаемая версия проекта. Обновите программу.')
+        photo = archive.read(meta['photo_file']) if meta.get('photo_file') else None
+        arrays = {}
+        if meta.get('arrays'):
+            with np.load(io.BytesIO(archive.read('arrays.npz')), allow_pickle=False) as payload:
+                arrays = {key: payload[key] for key in payload.files}
+            if sorted(arrays) != sorted(meta['arrays']):
+                raise ValueError('Список геометрии проекта не совпадает с данными.')
+    validate_project_payload(meta, arrays)
+    return (meta, photo, arrays)
 
 # ==================== studio_core ====================
 
@@ -1379,38 +1559,6 @@ def demo_relief(n=160):
     u, v = (x - 0.5, y - 0.5)
     h = np.clip(1 - ((u / 0.38) ** 2 + (v / 0.22) ** 2), 0, 1) ** 0.6
     return np.clip(h + 0.04 * np.sin(40 * (u * 0.6 + v)) * (h > 0), 0, 1.2)
-FORMAT, VERSION, EXT = ('StoneReliefStudioPro', 3, '.srelief')
-
-def pack_project(path, meta, photo=None, photo_name=None, arrays=None):
-    meta = dict(meta, format=FORMAT, version=VERSION, photo_file=None, arrays=sorted((arrays or {}).keys()))
-    if photo:
-        meta['photo_file'] = 'photo' + (os.path.splitext(photo_name or '')[1].lower() or '.png')
-    tmp = path + '.tmp'
-    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr('project.json', json.dumps(meta, ensure_ascii=False, indent=1))
-        if photo:
-            zf.writestr(meta['photo_file'], photo)
-        if arrays:
-            buf = io.BytesIO()
-            np.savez_compressed(buf, **{k: np.asarray(v, dtype=np.float32) for k, v in arrays.items()})
-            zf.writestr('arrays.npz', buf.getvalue())
-    os.replace(tmp, path)
-
-def unpack_project(path):
-    with zipfile.ZipFile(path) as zf:
-        if 'project.json' not in zf.namelist():
-            raise ValueError('Это не файл проекта Stone Relief.')
-        meta = json.loads(zf.read('project.json').decode('utf-8'))
-        if meta.get('format') != FORMAT:
-            raise ValueError('Неизвестный формат файла.')
-        if int(meta.get('version', 0)) > VERSION:
-            raise ValueError('Проект создан в более новой версии.')
-        photo = zf.read(meta['photo_file']) if meta.get('photo_file') else None
-        arrays = {}
-        if meta.get('arrays'):
-            with np.load(io.BytesIO(zf.read('arrays.npz'))) as d:
-                arrays = {k: d[k].astype(np.float64) for k in d.files}
-    return (meta, photo, arrays)
 from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QPolygonF, QShortcut
 from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsItem, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QInputDialog, QRadioButton, QButtonGroup, QProgressDialog, QTabWidget, QTextBrowser, QToolBar, QToolButton, QVBoxLayout, QWidget
@@ -2575,6 +2723,9 @@ class Studio(QMainWindow):
     def state_sig(self):
         h = hashlib.md5(self.state_sig_light().encode())
         h.update(self.photo_bytes or b'')
+        if self.stl_mesh is not None:
+            h.update(memoryview(np.ascontiguousarray(self.stl_mesh.vertices)).cast('B'))
+            h.update(memoryview(np.ascontiguousarray(self.stl_mesh.faces)).cast('B'))
         if self.z is not None:
             h.update(memoryview(np.ascontiguousarray(self.z)).cast('B'))
         h.update(str((self.sp_w.value(), self.sp_h.value(), self.sp_base.value(), self.sp_depth.value(), self.sl_photo.value())).encode())
@@ -4093,6 +4244,8 @@ class Studio(QMainWindow):
             self.cancel_preview()
             meta = {'settings': self._settings(), 'saved': time.strftime('%Y-%m-%d %H:%M:%S'), 'vec': [v.data.to_dict() for v in self.view.vectors()], 'ctrl': [(c.pos().x(), c.pos().y(), c.dh) for c in self.view.ctrl_points()]}
             arrays = {'z': self.z} if self.z is not None else {}
+            if self.z is None and self.stl_mesh is not None:
+                arrays = {'mesh_vertices': np.asarray(self.stl_mesh.vertices), 'mesh_faces': np.asarray(self.stl_mesh.faces, dtype=np.int64)}
             pack_project(path, meta, self.photo_bytes, self.photo_name, arrays)
         except Exception as ex:
             QMessageBox.critical(self, 'Ошибка сохранения', str(ex))
@@ -4151,18 +4304,31 @@ class Studio(QMainWindow):
 
     def open_project(self, path=None):
         if not self.confirm_discard():
-            return
+            return False
         if not isinstance(path, str):
             path, _ = QFileDialog.getOpenFileName(self, 'Открыть проект', '', 'Проект Stone Relief (*.srelief)')
         if not path:
-            return
+            return False
         try:
             meta, photo, arrays = unpack_project(path)
+            vectors = [VectorItem(PathData.from_dict(d)) for d in meta.get('vec', [])]
+            controls = [CtrlPoint(x, y, dh) for x, y, dh in meta.get('ctrl', [])]
+            prepared_photo = load_image_any(photo) if photo else None
+            prepared_mesh = None
+            if 'mesh_vertices' in arrays:
+                import trimesh
+                prepared_mesh = trimesh.Trimesh(vertices=arrays['mesh_vertices'], faces=arrays['mesh_faces'], process=False)
         except Exception as ex:
             QMessageBox.critical(self, 'Ошибка открытия', str(ex))
-            return
+            return False
         self._clear_all()
         st = meta.get('settings', {})
+        for widget, key in ((self.sp_w, 'w'), (self.sp_h, 'h')):
+            if key in st:
+                widget.blockSignals(True)
+                widget.setDecimals(6)
+                widget.setRange(min(widget.minimum(), st[key]), max(widget.maximum(), st[key]))
+                widget.blockSignals(False)
         for w, k in [(self.sp_w, 'w'), (self.sp_h, 'h'), (self.sp_base, 'base'), (self.sp_depth, 'depth'), (self.sp_step, 'step'), (self.sp_grid, 'grid'), (self.sp_blur, 'blur'), (self.sl_photo, 'photo_fade'), (self.cb_mat, 'material'), (self.l_bright, 'bright'), (self.l_contrast, 'contrast'), (self.l_az, 'az'), (self.l_el, 'el'), (self.c_level, 'level')]:
             if k in st:
                 w.blockSignals(True)
@@ -4177,15 +4343,15 @@ class Studio(QMainWindow):
         self.on_grid_changed(self.sp_grid.value())
         self.rebuild_canvas()
         if photo:
-            self.photo_bytes, self.photo_name = (photo, meta.get('photo_file') or 'photo.png')
-            self.photo_pil = ImageOps.exif_transpose(Image.open(io.BytesIO(photo))).convert('RGB')
+            self.photo_bytes, self.photo_name = (photo, meta.get('photo_name') or meta.get('photo_file') or 'photo.png')
+            self.photo_pil = prepared_photo
         self.update_photo_view()
-        for d in meta.get('vec', []):
-            self.scene.addItem(VectorItem(PathData.from_dict(d)))
-        for x, y, dh in meta.get('ctrl', []):
-            self.scene.addItem(CtrlPoint(x, y, dh))
+        for item in vectors + controls:
+            self.scene.addItem(item)
+        self.stl_mesh = prepared_mesh
         if 'z' in arrays:
             self.z = arrays['z']
+        if self.z is not None or self.stl_mesh is not None:
             self.show_mesh(reset=True)
         self.project_path = path
         self.setWindowTitle(f'{APP} — {os.path.basename(path)}')
@@ -4194,6 +4360,8 @@ class Studio(QMainWindow):
         self.after_change()
         self._saved_sig = self.state_sig()
         self.statusBar().showMessage('Проект открыт: ' + path)
+        self._loaded_project_settings = st
+        return True
 
     def closeEvent(self, e):
         if self.confirm_discard():
@@ -4508,7 +4676,7 @@ class StoneStudio(Studio):
             menus['Рельефы'].addAction(title, lambda op=op: self.relief_op(op))
         menus['Рельефы'].addAction(actions['stl'])
         menus['Справка'].addAction(self._action('Справочник инструментов', 'new', self.open_help, 'F1'))
-        menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.1.'))
+        menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.2.'))
         filebar = self._toolbar('Проект и правка')
         for key in ('new', 'open', 'save', 'undo', 'redo', 'copy', 'delete', 'transform'):
             filebar.addAction(actions[key])
@@ -4940,6 +5108,14 @@ class StoneStudio(Studio):
     def _settings(self):
         return dict(super()._settings(), workspace=self._parameters())
 
+    def _write(self, path):
+        self._sculpt_release()
+        return super()._write(path)
+
+    def confirm_discard(self):
+        self._sculpt_release()
+        return super().confirm_discard()
+
     def state_sig(self):
         import hashlib
         return hashlib.sha256((super().state_sig() + json.dumps(self._parameters(), sort_keys=True)).encode()).hexdigest()
@@ -4970,12 +5146,12 @@ class StoneStudio(Studio):
             path, _ = QFileDialog.getOpenFileName(self, 'Открыть проект', '', 'Stone Relief (*.srelief)')
         if not path:
             return
-        super().open_project(path)
-        if self.project_path == path:
-            meta, _, _ = unpack_project(path)
-            self._restore_parameters(meta.get('settings', {}).get('workspace', {}))
+        if super().open_project(path):
+            self._restore_parameters(self._loaded_project_settings.get('workspace', {}))
             self.update_rulers()
             self._saved_sig = self.state_sig()
+            return True
+        return False
 
     def new_project(self):
         super().new_project()
@@ -5008,16 +5184,19 @@ class StoneStudio(Studio):
     def _install_sculpt(self):
         page = QWidget()
         form = QFormLayout(page)
-        helptext = QLabel('Выберите замкнутый контур лепестка в 2D, затем включите «Лепка в 3D».\n\nНажмите на поверхность и тяните мышь вверх или вниз. Мелкая фактура сохраняется: изменяется только высота.\n\nБез контура изменяется область кисти. Ctrl+Z отменяет весь жест.')
+        helptext = QLabel('Выберите замкнутый контур лепестка в 2D, затем включите «Лепка в 3D».\n\nНажмите на поверхность и тяните мышь вверх или вниз. Мелкая фактура сохраняется: изменяется только высота.\n\nБез контура изменяется область кисти. Ctrl+Z отменяет весь жест.\n\n0 рельефа — верх основания. Для углублений ниже этого уровня отключите защиту толщины. Дно плиты находится на Z=0.')
         helptext.setWordWrap(True)
         form.addRow(helptext)
         self.sculpt_radius = self._spin(15, 0.5, 500, 2)
         self.sculpt_gain = self._spin(0.05, 0.001, 5, 3, ' мм/px', 0.01)
         self.sculpt_fixed = QCheckBox('Зафиксировать край выделенного контура')
         self.sculpt_fixed.setChecked(True)
+        self.sculpt_protect_base = QCheckBox('Сохранять толщину основания')
+        self.sculpt_protect_base.setChecked(True)
         form.addRow('Радиус', self.sculpt_radius)
         form.addRow('Сила', self.sculpt_gain)
         form.addRow(self.sculpt_fixed)
+        form.addRow(self.sculpt_protect_base)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(page)
@@ -5076,8 +5255,11 @@ class StoneStudio(Studio):
             return
         _, y = self.plotter.iren.interactor.GetEventPosition()
         delta = (y - self._stroke['y']) * self.sculpt_gain.value()
-        self.z = np.maximum(self._stroke['base'] + delta * self._stroke['weight'], 0.05)
-        self._stroke['changed'] = abs(delta) > 1e-08
+        base, weight = (self._stroke['base'], self._stroke['weight'])
+        floor = self.sp_base.value() if self.sculpt_protect_base.isChecked() else 0.05
+        floor = np.minimum(base, floor)
+        self.z = np.maximum(base + delta * weight, floor)
+        self._stroke['changed'] = not np.array_equal(self.z, base)
         if not self._sculpt_timer.isActive():
             self._sculpt_timer.start(60)
 
@@ -5092,10 +5274,10 @@ class StoneStudio(Studio):
         self.show_mesh()
 
     def closeEvent(self, event):
+        self._sculpt_release()
         if not self.confirm_discard():
             event.ignore()
             return
-        self._sculpt_release()
         self.settings.setValue('geometry', self.saveGeometry())
         self.settings.setValue('dockState', self.saveState())
         for key, dialog in [('sweep', self.sweep_dialog), ('shape', self.relief_dialog)]:
