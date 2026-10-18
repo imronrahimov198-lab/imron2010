@@ -7,20 +7,57 @@
 Установка библиотек:
 python -m pip install PySide6 numpy Pillow scipy trimesh pyvista pyvistaqt qtpy ezdxf rtree svgelements shapely "vtk>=9.5,<9.6"
 
-Версия 3.3: Home возвращает модель в кадр в 2D и 3D; Ctrl+Home приближает
-выделенные векторы. В панели модели показаны их размеры и положение в мм.
-Меню «Файл → Недавние проекты» хранит последние шесть проектов.
-Радиус и сила кисти, защита основания, шаг узлов и привязки запоминаются.
-Сохранены исправления версии 3.2: проверка проектов, сохранение исходной
-STL-сетки и жеста лепки перед закрытием, ускоренная проверка STL.
-Ноль рельефа соответствует верху основания; его толщину можно защитить при лепке.
-Проекты формата 4 читаются этой версией; поддерживается открытие форматов 2 и 3.
-STL не хранит обязательных единиц: при открытии выберите миллиметры.
-Проверка STL не обнаруживает произвольные самопересечения треугольников.
-Лимит буферов истории по умолчанию — 256 МБ; последний шаг сохраняется всегда.
-Независимые слои, управляющие линии и свободное редактирование сетки по X/Y
-пока не реализованы. Рельеф хранится как одна высота на точку XY.
+Рабочий этап Pro 3.3: аудит, Interactive Relief Manipulation и Mesh Edit.
+Существующие Studio, F12, две направляющие, векторы и «Лепка в 3D» сохранены.
+Контрольные точки: Z в мм, закрепление, Local/Full Surface, маска и края,
+фоновый предпросмотр, применение одной операцией Undo/Redo.
+Mesh Edit открывает исходный STL без карты высот и смещает вершины X/Y/Z.
+Проект формата 5 хранит точки и закрепления; открываются форматы 2, 3 и 4.
+Новый проект не открывается старыми версиями программы.
+Файлы распаковки ограничены 384 МиБ, массивы — 256 МиБ, фото — 64 МиБ
+и 24 млн пикселей. Предыдущий файл сохраняется при отмене записи.
+Минимальная толщина карты высот и допуск float32 настраиваются в «Модель».
+STL интерпретируется в мм; полной проверки самопересечений и толщины
+произвольной сетки в этом этапе ещё нет.
+Независимые слои, управляющие линии Безье, новые кисти и полный STL Inspector
+остаются следующими этапами. Это рабочий этап, а не выполнение всего ТЗ.
+Windows 10/11: требуется 64-битный Python 3.12 и OpenGL. Windows не проверен.
+Windows 7 не поддерживается текущим PySide6/Qt6 и требует отдельного порта.
 """
+
+# ==================== input_limits ====================
+
+import io
+import os
+import warnings
+from PIL import Image
+MAX_IMAGE_PIXELS = 24000000
+MAX_IMAGE_SIDE = 16384
+MAX_IMAGE_BYTES = 64 * 1024 ** 2
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+def read_checked_file(path, limit=MAX_IMAGE_BYTES):
+    if os.path.getsize(path) > limit:
+        raise ValueError(f'Файл превышает предел {limit // 1024 ** 2} МиБ. Уменьшите размер исходного файла.')
+    with open(path, 'rb') as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError('Размер файла изменился во время чтения. Повторите открытие.')
+    return data
+
+def open_checked_image(raw):
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError('Изображение больше 64 МиБ. Сохраните уменьшенную копию.')
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', Image.DecompressionBombWarning)
+            image = Image.open(io.BytesIO(raw))
+        if max(image.size) > MAX_IMAGE_SIDE or image.width * image.height > MAX_IMAGE_PIXELS:
+            image.close()
+            raise ValueError('Изображение превышает 24 млн пикселей или сторону 16384 px. Уменьшите разрешение.')
+        return image
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+        raise ValueError('Слишком большое изображение. Уменьшите разрешение до 24 млн пикселей.') from error
 
 # ==================== vector_import ====================
 
@@ -85,11 +122,12 @@ import math
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from shapely.geometry import Polygon
+from shapely.ops import unary_union
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 def photo_heights(raw, nx, ny, blur=0, invert=False):
     """Keep the source height precision; RGB previews never feed this calculation."""
-    original = Image.open(io.BytesIO(raw))
+    original = open_checked_image(raw)
     tags = getattr(original, 'tag_v2', {})
     bits, sample_format = (tags.get(258), tags.get(339))
     if isinstance(bits, tuple):
@@ -144,10 +182,19 @@ def project_ruled(px, py, a, b):
     outputs = []
     for start in range(0, len(points), 800):
         q = points[start:start + 800]
-        r = q[:, None, :] - a[None, :, :]
-        v = np.clip(np.sum(r * d, axis=2) / dd, 0, 1)
-        err = np.sum((r - v[:, :, None] * d) ** 2, axis=2)
-        k = np.argmin(err, axis=1)
+        nearest = np.full(len(q), np.inf)
+        k = np.zeros(len(q), dtype=np.int64)
+        initial_v = np.zeros(len(q))
+        for offset in range(0, len(a), 256):
+            section = slice(offset, offset + 256)
+            r = q[:, None, :] - a[None, section, :]
+            v = np.clip(np.sum(r * d[None, section, :], axis=2) / dd[None, section], 0, 1)
+            err = np.sum((r - v[:, :, None] * d[None, section, :]) ** 2, axis=2)
+            local_k = np.argmin(err, axis=1)
+            values = err[np.arange(len(q)), local_k]
+            take = values < nearest
+            nearest[take], k[take] = (values[take], local_k[take] + offset)
+            initial_v[take] = v[np.arange(len(q)), local_k][take]
         best = np.full(len(q), np.inf)
         best_v = np.zeros(len(q))
         best_s = np.zeros(len(q))
@@ -156,7 +203,7 @@ def project_ruled(px, py, a, b):
             aa, da = (a[j], a[j + 1] - a[j])
             d0, delta = (d[j], d[j + 1] - d[j])
             t = np.full(len(q), 0.5)
-            u = v[np.arange(len(q)), k].copy()
+            u = initial_v.copy()
             for _ in range(8):
                 dv = d0 + t[:, None] * delta
                 ds = da + u[:, None] * delta
@@ -186,13 +233,36 @@ def coverage(polys, nx, ny, ss=None):
     shapes = [Polygon(p) for p in polys if len(p) >= 3]
     if any((not p.is_valid for p in shapes)):
         raise ValueError('Контур пересекает сам себя. Исправьте узлы перед построением рельефа.')
-    ordered = sorted(shapes, key=lambda p: p.area, reverse=True)
+    ordered = []
+    for shape in sorted(shapes, key=lambda p: p.area, reverse=True):
+        if not any((shape.equals(previous) for previous in ordered)):
+            ordered.append(shape)
+    children = [[] for _ in ordered]
+    roots = []
+    for index, shape in enumerate(ordered):
+        parents = [j for j in range(index) if shape.within(ordered[j])]
+        if parents:
+            children[min(parents, key=lambda j: ordered[j].area)].append(index)
+        else:
+            roots.append(index)
+    regions = list(ordered)
+    for index in range(len(ordered) - 1, -1, -1):
+        if children[index]:
+            regions[index] = ordered[index].difference(unary_union([regions[j] for j in children[index]]))
+    geometry = unary_union([regions[j] for j in roots])
     image = Image.new('L', (nx * ss, ny * ss), 0)
     draw = ImageDraw.Draw(image)
-    for index, p in enumerate(ordered):
-        depth = sum((p.within(parent) and (not p.equals(parent)) for parent in ordered[:index]))
-        xy = [((x + 0.5) * ss - 0.5, (y + 0.5) * ss - 0.5) for x, y in p.exterior.coords]
-        draw.polygon(xy, fill=0 if depth % 2 else 255)
+
+    def paint(polygon):
+        if polygon.geom_type == 'Polygon':
+            convert = lambda ring: [((x + 0.5) * ss - 0.5, (y + 0.5) * ss - 0.5) for x, y in ring.coords]
+            draw.polygon(convert(polygon.exterior), fill=255)
+            for ring in polygon.interiors:
+                draw.polygon(convert(ring), fill=0)
+        elif hasattr(polygon, 'geoms'):
+            for child in polygon.geoms:
+                paint(child)
+    paint(geometry)
     return np.asarray(image).reshape(ny, ss, nx, ss).sum(axis=(1, 3), dtype=np.float32) / (255 * ss * ss)
 
 def sculpt_weight(shape, center, cell, radius, mask=None, fixed=True):
@@ -266,7 +336,7 @@ def trim_history_stacks(undo, redo, budget, max_steps=25):
 from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-PATHS = {'new': '<path d="M8 4h12l5 5v19H8z M20 4v6h5 M12 18h9 M16.5 13.5v9"/>', 'open': '<path d="M4 10h10l3 4h12l-4 13H5z M5 10V7h10l3 3"/>', 'save': '<path d="M6 5h18l3 3v19H6z M11 5v8h11V5 M11 27v-9h11v9"/>', 'undo': '<path d="M12 7l-7 7 7 6 M6 14h13q8 0 8 7v4"/>', 'redo': '<path d="M20 7l7 7-7 6 M26 14H13q-8 0-8 7v4"/>', 'select': '<path d="M8 4l19 15-10 1-4 9z"/>', 'nodes': '<path d="M6 24C6 6 26 27 26 8 M6 24l5-17 M26 8l-4 18"/><rect x="3" y="21" width="6" height="6"/><rect x="23" y="5" width="6" height="6"/>', 'pen': '<path d="M7 25l2-8L23 3l6 6-14 14z M9 17l6 6 M21 5l6 6"/>', 'rectangle': '<rect x="4" y="8" width="24" height="17" rx="1"/>', 'square': '<rect x="6" y="6" width="20" height="20" rx="1"/>', 'ellipse': '<ellipse cx="16" cy="16" rx="13" ry="8"/>', 'circle': '<circle cx="16" cy="16" r="11"/>', 'polygon': '<path d="M16 3l12 9-5 15H9L4 12z"/>', 'star': '<path d="M16 3l4 8 9 2-7 7 1 9-7-4-8 4 2-9-7-7 9-2z"/>', 'text': '<path d="M5 8V5h22v3 M16 5v22 M11 27h10"/>', 'point': '<circle cx="16" cy="16" r="5"/><path d="M16 2v6 M16 24v6 M2 16h6 M24 16h6"/>', 'shape': '<path d="M3 25h26 M5 23C7 4 25 4 27 23 M11 23C12 12 20 12 21 23"/>', 'rails': '<path d="M4 26Q5 10 13 4 M17 28Q30 18 26 5 M5 23Q17 11 27 19 M7 15Q18 5 27 12"/>', 'dome': '<path d="M4 23q12-28 24 0 M4 23q12 9 24 0 M16 6v21"/>', 'plate': '<path d="M3 14l17-8 10 9-17 9z M3 14v5l10 9 17-8v-5 M13 24v4"/>', 'sculpt': '<path d="M3 26q7-19 13-12t13 5 M17 6l4-3 6 8-5 3z M17 6l-5 10 10-2"/>', 'smooth': '<path d="M3 23l5-10 5 7 6-14 10 12 M3 27q11-13 26-4"/>', 'zero': '<path d="M3 24h26 M8 8l16 11 M24 8L8 19"/>', 'stl': '<path d="M16 3L3 11v14l13 5 13-9V9z M3 11l13 7 13-9 M16 18v12 M16 3v15"/>', 'photo': '<rect x="3" y="5" width="26" height="22" rx="2"/><circle cx="10" cy="12" r="3"/><path d="M4 25l8-8 5 4 6-9 6 13"/>', 'fit': '<path d="M11 4H4v7 M21 4h7v7 M4 21v7h7 M28 21v7h-7"/><rect x="9" y="10" width="14" height="12"/>', 'copy': '<rect x="5" y="4" width="16" height="19"/><path d="M12 23v5h15V10h-6"/>', 'delete': '<path d="M5 8h22 M12 8V4h8v4 M8 8l2 20h12l2-20 M13 12v11 M19 12v11"/>', 'transform': '<path d="M4 13V4h9 M4 4l9 9 M19 28h9v-9 M28 28l-9-9"/><rect x="11" y="11" width="10" height="10"/>'}
+PATHS = {'book': '<path d="M3 6q7-3 13 1 6-4 13-1v20q-7-3-13 1-6-4-13-1z M16 7v20 M6 11q4-1 7 1 M6 16q4-1 7 1 M19 12q3-2 7-1 M19 17q3-2 7-1"/>', 'new': '<path d="M8 4h12l5 5v19H8z M20 4v6h5 M12 18h9 M16.5 13.5v9"/>', 'open': '<path d="M4 10h10l3 4h12l-4 13H5z M5 10V7h10l3 3"/>', 'save': '<path d="M6 5h18l3 3v19H6z M11 5v8h11V5 M11 27v-9h11v9"/>', 'undo': '<path d="M12 7l-7 7 7 6 M6 14h13q8 0 8 7v4"/>', 'redo': '<path d="M20 7l7 7-7 6 M26 14H13q-8 0-8 7v4"/>', 'select': '<path d="M8 4l19 15-10 1-4 9z"/>', 'nodes': '<path d="M6 24C6 6 26 27 26 8 M6 24l5-17 M26 8l-4 18"/><rect x="3" y="21" width="6" height="6"/><rect x="23" y="5" width="6" height="6"/>', 'pen': '<path d="M7 25l2-8L23 3l6 6-14 14z M9 17l6 6 M21 5l6 6"/>', 'rectangle': '<rect x="4" y="8" width="24" height="17" rx="1"/>', 'square': '<rect x="6" y="6" width="20" height="20" rx="1"/>', 'ellipse': '<ellipse cx="16" cy="16" rx="13" ry="8"/>', 'circle': '<circle cx="16" cy="16" r="11"/>', 'polygon': '<path d="M16 3l12 9-5 15H9L4 12z"/>', 'star': '<path d="M16 3l4 8 9 2-7 7 1 9-7-4-8 4 2-9-7-7 9-2z"/>', 'text': '<path d="M5 8V5h22v3 M16 5v22 M11 27h10"/>', 'point': '<circle cx="16" cy="16" r="5"/><path d="M16 2v6 M16 24v6 M2 16h6 M24 16h6"/>', 'shape': '<path d="M3 25h26 M5 23C7 4 25 4 27 23 M11 23C12 12 20 12 21 23"/>', 'rails': '<path d="M4 26Q5 10 13 4 M17 28Q30 18 26 5 M5 23Q17 11 27 19 M7 15Q18 5 27 12"/>', 'dome': '<path d="M4 23q12-28 24 0 M4 23q12 9 24 0 M16 6v21"/>', 'plate': '<path d="M3 14l17-8 10 9-17 9z M3 14v5l10 9 17-8v-5 M13 24v4"/>', 'sculpt': '<path d="M3 26q7-19 13-12t13 5 M17 6l4-3 6 8-5 3z M17 6l-5 10 10-2"/>', 'smooth': '<path d="M3 23l5-10 5 7 6-14 10 12 M3 27q11-13 26-4"/>', 'zero': '<path d="M3 24h26 M8 8l16 11 M24 8L8 19"/>', 'stl': '<path d="M16 3L3 11v14l13 5 13-9V9z M3 11l13 7 13-9 M16 18v12 M16 3v15"/>', 'photo': '<rect x="3" y="5" width="26" height="22" rx="2"/><circle cx="10" cy="12" r="3"/><path d="M4 25l8-8 5 4 6-9 6 13"/>', 'fit': '<path d="M11 4H4v7 M21 4h7v7 M4 21v7h7 M28 21v7h-7"/><rect x="9" y="10" width="14" height="12"/>', 'copy': '<rect x="5" y="4" width="16" height="19"/><path d="M12 23v5h15V10h-6"/>', 'delete': '<path d="M5 8h22 M12 8V4h8v4 M8 8l2 20h12l2-20 M13 12v11 M19 12v11"/>', 'transform': '<path d="M4 13V4h9 M4 4l9 9 M19 28h9v-9 M28 28l-9-9"/><rect x="11" y="11" width="10" height="10"/>'}
 
 def icon(name, accent=False):
     color = '#b66a3b' if accent else '#344b5b'
@@ -307,7 +377,7 @@ def _export_progress(callback, phase, current, total):
     if callback:
         callback(phase, current, total)
 
-def validate_stl_mesh(vertices, faces, progress=None, chunk_size=8192):
+def validate_stl_mesh(vertices, faces, progress=None, chunk_size=8192, precision_tolerance=0.001):
     """Check indexed geometry; bound the RAM edge index and spill large meshes to disk.
 
     Detects invalid coordinates/indices, degenerate triangles, open/nonmanifold
@@ -315,6 +385,8 @@ def validate_stl_mesh(vertices, faces, progress=None, chunk_size=8192):
     arbitrary triangle self-intersections.
     """
     vertices, faces = (np.asarray(vertices), np.asarray(faces))
+    if not math.isfinite(precision_tolerance) or precision_tolerance <= 0:
+        raise ValueError('Допуск координат STL должен быть положительным конечным числом в мм.')
     if vertices.ndim != 2 or vertices.shape[1] != 3 or (not len(vertices)):
         raise ValueError('В модели нет вершин XYZ.')
     if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) < 4:
@@ -328,6 +400,9 @@ def validate_stl_mesh(vertices, faces, progress=None, chunk_size=8192):
         block = vertices[start:start + chunk_size]
         if not np.isfinite(block).all() or np.max(np.abs(block)) > np.finfo(np.float32).max:
             raise ValueError('Координаты содержат NaN, бесконечность или выходят за диапазон STL.')
+        error = float(np.max(np.abs(block.astype(np.float64) - block.astype(np.float32).astype(np.float64))))
+        if error > precision_tolerance:
+            raise ValueError(f'Преобразование в float32 изменяет координаты на {error:.6g} мм, больше допуска {precision_tolerance:g} мм. Переместите модель ближе к началу координат или выберите обоснованный допуск.')
         low, high = (np.minimum(low, block.min(axis=0)), np.maximum(high, block.max(axis=0)))
     if np.any(high <= low):
         raise ValueError('Модель должна иметь положительные размеры по X, Y и Z.')
@@ -423,9 +498,9 @@ def _atomic_stl(path, report, batches, progress=None):
             temporary.unlink(missing_ok=True)
     return report
 
-def export_indexed_stl(path, vertices, faces, progress=None, chunk_size=8192):
+def export_indexed_stl(path, vertices, faces, progress=None, chunk_size=8192, precision_tolerance=0.001):
     vertices, faces = (np.asarray(vertices), np.asarray(faces))
-    report = validate_stl_mesh(vertices, faces, progress, chunk_size)
+    report = validate_stl_mesh(vertices, faces, progress, chunk_size, precision_tolerance)
     batches = (vertices[faces[start:start + chunk_size]] for start in range(0, len(faces), chunk_size))
     return _atomic_stl(path, report, batches, progress)
 
@@ -451,12 +526,14 @@ def _heightfield_batches(z, xs, ys, chunk_size=8192):
         centre = np.zeros_like(a)
         yield np.concatenate((np.stack((a, bottom_a, bottom_b), axis=1), np.stack((a, bottom_b, b), axis=1), np.stack((centre, bottom_b, bottom_a), axis=1)))
 
-def export_heightmap_stl(path, z, width, height, progress=None):
+def export_heightmap_stl(path, z, width, height, progress=None, minimum_thickness=0.05, precision_tolerance=0.001):
     z = np.asarray(z)
     if z.ndim != 2 or min(z.shape) < 2:
         raise ValueError('Рельеф должен содержать минимум 2×2 точки.')
     if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or (height <= 0):
         raise ValueError('Ширина и высота модели должны быть положительными числами в миллиметрах.')
+    if not math.isfinite(minimum_thickness) or minimum_thickness < 0.05 or (not math.isfinite(precision_tolerance)) or (precision_tolerance <= 0):
+        raise ValueError('Проверьте минимальную толщину (от 0,05 мм) и положительный допуск STL.')
     ny, nx = z.shape
     count = 2 * (nx - 1) * (ny - 1) + 3 * (2 * nx + 2 * ny - 4)
     if count > 4294967295:
@@ -468,10 +545,18 @@ def export_heightmap_stl(path, z, width, height, progress=None):
             raise ValueError('Карта высот содержит NaN, бесконечность или слишком большие значения.')
         if np.any(block <= 0) or np.any(np.asarray(block, dtype=np.float32) <= 0):
             raise ValueError('Поверхность касается или пересекает дно Z=0. Увеличьте толщину основания перед экспортом.')
+        if np.min(np.asarray(block, dtype=np.float32)) < minimum_thickness - 1e-07:
+            raise ValueError(f'Толщина основания меньше {minimum_thickness:g} мм. Поднимите поверхность или увеличьте основание; ослабляйте предел только осознанно.')
+        error = float(np.max(np.abs(block.astype(np.float64) - block.astype(np.float32).astype(np.float64))))
+        if error > precision_tolerance:
+            raise ValueError(f'Потеря точности Z при записи STL: {error:g} мм. Уменьшите высоту или измените допуск.')
         maximum = max(maximum, float(block.max()))
         _export_progress(progress, 'check', min(start + 64, ny), ny)
     xs = np.linspace(-width / 2, width / 2, nx, dtype=np.float32)
     ys = np.linspace(-height / 2, height / 2, ny, dtype=np.float32)
+    error = max(float(np.max(np.abs(xs.astype(float) - np.linspace(-width / 2, width / 2, nx)))), float(np.max(np.abs(ys.astype(float) - np.linspace(-height / 2, height / 2, ny)))))
+    if error > precision_tolerance:
+        raise ValueError(f'Потеря точности X/Y: {error:g} мм. Уменьшите размеры модели или измените допуск STL.')
     if np.any(np.diff(xs) <= 0) or np.any(np.diff(ys) <= 0) or (not np.isfinite(xs).all()) or (not np.isfinite(ys).all()):
         raise ValueError('Шаг координат нельзя представить в STL без вырождения треугольников.')
     integral = 0.0
@@ -482,6 +567,151 @@ def export_heightmap_stl(path, z, width, height, progress=None):
     report = ExportReport(count, (float(width), float(height), maximum), float(volume))
     return _atomic_stl(path, report, _heightfield_batches(z, xs, ys), progress)
 
+# ==================== interactive_geometry ====================
+
+import math
+import numpy as np
+from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.spatial import cKDTree
+
+class ManipulationCancelled(Exception):
+    pass
+
+def _manipulation_progress(callback, current, total):
+    if callback:
+        callback(current, total)
+
+def validate_control_points(controls):
+    if not isinstance(controls, list) or len(controls) > 128:
+        raise ValueError('Допустимо до 128 контрольных точек. Разделите деформацию на несколько операций.')
+    identifiers = set()
+    for point in controls:
+        if not isinstance(point, dict):
+            raise ValueError('Повреждена контрольная точка.')
+        for key in ('x', 'y', 'z'):
+            value = point.get(key)
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError('Координаты контрольной точки должны быть конечными числами в мм.')
+        if type(point.get('pinned', False)) is not bool:
+            raise ValueError('Повреждён признак закрепления точки.')
+        uid = point.get('id')
+        if not isinstance(uid, str) or not uid or uid in identifiers:
+            raise ValueError('Некорректный идентификатор контрольной точки.')
+        identifiers.add(uid)
+
+def surface_samples(z, xy, width, height):
+    xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    indices = np.array([(xy[:, 1] + height / 2) * (z.shape[0] - 1) / height, (xy[:, 0] + width / 2) * (z.shape[1] - 1) / width])
+    return map_coordinates(np.asarray(z), indices, order=1, mode='nearest', output=np.float64)
+
+def deform_control_surface(z, controls, width, height, mask=None, fixed=True, mode='local', radius=15.0, strength=1.0, feather=3.0, progress=None):
+    """Interpolate displacement constraints, then add to the untouched detailed Z.
+
+    Full uses a smooth Gaussian RBF with an affine tail when constraints span XY.
+    Local uses the compact C2 Wendland kernel (exactly zero beyond radius).
+    A smooth Dirichlet taper fixes the first boundary ring. Kernel targets are
+    compensated for that taper, so interior control points retain their target Z.
+    """
+    validate_control_points(controls)
+    z = np.asarray(z)
+    if z.ndim != 2 or min(z.shape) < 2 or (not np.isfinite(z).all()):
+        raise ValueError('Нужна корректная карта высот размером не менее 2×2.')
+    if mode not in ('local', 'full') or min(width, height, radius, feather) <= 0 or (not 0 <= strength <= 2):
+        raise ValueError('Проверьте режим, радиус, плавность и силу деформации.')
+    if not controls:
+        raise ValueError('Добавьте контрольную точку щелчком по поверхности.')
+    mask = np.ones(z.shape, bool) if mask is None else np.asarray(mask, dtype=bool)
+    if mask.shape != z.shape or not mask.any():
+        raise ValueError('Выделенная область пуста или не совпадает с рельефом.')
+    xy = np.array([[p['x'], p['y']] for p in controls], dtype=np.float64)
+    if np.any(np.abs(xy) > [width / 2 + 1e-08, height / 2 + 1e-08]):
+        raise ValueError('Контрольная точка за пределами плиты. Переместите её на рельеф.')
+    cx, cy = (width / (z.shape[1] - 1), height / (z.shape[0] - 1))
+    indices = np.array([(xy[:, 1] + height / 2) / cy, (xy[:, 0] + width / 2) / cx])
+    if np.any(map_coordinates(mask.astype(float), indices, order=0, mode='nearest') < 0.5):
+        raise ValueError('Точка находится вне выбранной области. Измените маску или удалите точку.')
+    base = surface_samples(z, xy, width, height)
+    delta = np.array([p['z'] for p in controls]) - base
+    delta *= np.array([1.0 if p.get('pinned') else strength for p in controls])
+    taper = mask.astype(np.float32)
+    if fixed:
+        distance = distance_transform_edt(np.pad(mask, 1), sampling=(cy, cx))[1:-1, 1:-1]
+        t = np.clip((distance - max(cx, cy)) / max(feather, max(cx, cy)), 0, 1)
+        taper *= t * t * (3 - 2 * t)
+    at_control = map_coordinates(taper, indices, order=1, mode='nearest')
+    if np.any((at_control < 1e-06) & (np.abs(delta) > 1e-06)):
+        raise ValueError('Точка на закреплённом краю не может менять высоту. Отключите фиксацию или сдвиньте точку внутрь.')
+    targets = delta / np.maximum(at_control, 1e-06)
+    distances = np.linalg.norm(xy[:, None, :] - xy[None, :, :], axis=2)
+    if np.any(distances + np.eye(len(xy)) < 1e-06):
+        raise ValueError('Контрольные точки совпадают. Оставьте одну точку в этом месте.')
+    scale = radius if mode == 'local' else max(width, height, radius)
+
+    def kernel(distance):
+        r = distance / scale
+        return np.maximum(1 - r, 0) ** 4 * (4 * r + 1) if mode == 'local' else np.exp(-r * r)
+    matrix = kernel(distances)
+    polynomial = None
+    if mode == 'full':
+        affine = np.column_stack((np.ones(len(xy)), xy / scale))
+        polynomial = affine if np.linalg.matrix_rank(affine) == 3 else affine[:, :1]
+        n = polynomial.shape[1]
+        matrix = np.block([[matrix, polynomial], [polynomial.T, np.zeros((n, n))]])
+        rhs = np.r_[targets, np.zeros(n)]
+    else:
+        rhs = targets
+    _manipulation_progress(progress, 0, z.size)
+    try:
+        coefficients = np.linalg.solve(matrix, rhs)
+    except np.linalg.LinAlgError as error:
+        raise ValueError('Ограничения плохо обусловлены. Раздвиньте близкие точки или уменьшите их число.') from error
+    result = np.array(z, dtype=np.float32, copy=True)
+    for start in range(0, z.size, 8192):
+        ids = np.arange(start, min(start + 8192, z.size))
+        yy, xx = np.divmod(ids, z.shape[1])
+        query = np.column_stack((xx * cx - width / 2, yy * cy - height / 2))
+        values = kernel(np.linalg.norm(query[:, None, :] - xy[None, :, :], axis=2)) @ coefficients[:len(xy)]
+        if polynomial is not None:
+            p = np.column_stack((np.ones(len(query)), query / scale))[:, :polynomial.shape[1]]
+            values += p @ coefficients[len(xy):]
+        result.ravel()[ids] += values * taper.ravel()[ids]
+        _manipulation_progress(progress, min(start + 8192, z.size), z.size)
+    if not np.isfinite(result).all() or np.min(result) < 0.05:
+        raise ValueError('Деформация пересекает дно плиты (Z<0,05 мм). Уменьшите смещение или увеличьте основание.')
+    return result
+
+def deform_mesh_vertices(vertices, selected, delta, radius=0.0, strength=1.0, pinned=(), progress=None):
+    """Move exact indexed vertices in XYZ; never rasterize or alter connectivity."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    selected = np.unique(np.asarray(selected, dtype=np.int64))
+    pinned = np.unique(np.asarray(pinned, dtype=np.int64))
+    delta = np.asarray(delta, dtype=np.float64)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or (not np.isfinite(vertices).all()):
+        raise ValueError('Некорректная исходная сетка.')
+    if not len(selected) or selected.min() < 0 or selected.max() >= len(vertices):
+        raise ValueError('Выберите вершины, ребро или грань сетки.')
+    if len(pinned) and (pinned.min() < 0 or pinned.max() >= len(vertices)):
+        raise ValueError('Некорректные закреплённые вершины.')
+    if delta.shape != (3,) or not np.isfinite(delta).all() or (not math.isfinite(radius)) or (radius < 0) or (not 0 <= strength <= 2):
+        raise ValueError('Проверьте смещения X/Y/Z, радиус и силу.')
+    selected = np.setdiff1d(selected, pinned)
+    if not len(selected):
+        raise ValueError('Все выбранные вершины закреплены. Снимите фиксацию.')
+    tree = cKDTree(vertices[selected]) if radius > 0 else None
+    result = vertices.copy()
+    for start in range(0, len(vertices), 65536):
+        end = min(start + 65536, len(vertices))
+        if tree is not None:
+            distance = tree.query(vertices[start:end])[0] / radius
+            weight = np.maximum(1 - distance, 0) ** 4 * (4 * distance + 1)
+            result[start:end] += weight[:, None] * delta * strength
+        _manipulation_progress(progress, end, len(vertices))
+    result[selected] = vertices[selected] + delta * strength
+    result[pinned] = vertices[pinned]
+    if not np.isfinite(result).all():
+        raise ValueError('Смещение вышло за диапазон координат. Уменьшите его.')
+    return result
+
 # ==================== project_storage ====================
 
 import io
@@ -491,7 +721,13 @@ import os
 import tempfile
 import zipfile
 import numpy as np
-FORMAT, VERSION, EXT = ('StoneReliefStudioPro', 4, '.srelief')
+FORMAT, VERSION, EXT = ('StoneReliefStudioPro', 5, '.srelief')
+MAX_PROJECT_BYTES = 384 * 1024 ** 2
+MAX_ARRAY_BYTES = 256 * 1024 ** 2
+MAX_METADATA_BYTES = 8 * 1024 ** 2
+
+class ProjectCancelled(Exception):
+    pass
 
 def _project_number(value, label, minimum=None, maximum=None, integer=False):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
@@ -512,6 +748,12 @@ def validate_project_payload(meta, arrays):
     settings = meta.get('settings', {})
     if not isinstance(settings, dict):
         raise ValueError('Повреждены настройки проекта.')
+    export = settings.get('export_options', {})
+    if not isinstance(export, dict):
+        raise ValueError('Повреждены параметры экспорта STL.')
+    for key, low, high in [('minimum_thickness', 0.05, 200), ('precision', 1e-06, 1)]:
+        if key in export:
+            _project_number(export[key], key, low, high)
     ranges = dict(w=(1e-06, 1000000000.0), h=(1e-06, 1000000000.0), base=(0.5, 200), depth=(0.5, 200), step=(0.05, 2), grid=(0.5, 500), blur=(0, 15), photo_fade=(0, 100), bright=(0, 100), contrast=(0, 100), az=(-180, 180), el=(3, 90), level=(0, 500), material=(0, 3))
     integers = {'photo_fade', 'bright', 'contrast', 'az', 'el', 'material'}
     for key, bounds in ranges.items():
@@ -596,23 +838,78 @@ def validate_project_payload(meta, arrays):
         vertices, faces = (arrays['mesh_vertices'], arrays['mesh_faces'])
         if vertices.ndim != 2 or vertices.shape[1] != 3 or (not len(vertices)) or (faces.ndim != 2) or (faces.shape[1] != 3) or (not len(faces)) or (faces.dtype.kind not in 'iu') or (faces.min() < 0) or (faces.max() >= len(vertices)):
             raise ValueError('Повреждены вершины или индексы сетки проекта.')
+    interactive = settings.get('interactive', {})
+    if not isinstance(interactive, dict):
+        raise ValueError('Повреждены параметры Interactive Relief Manipulation.')
+    validate_control_points(interactive.get('controls', []))
+    bindings = interactive.get('mask_vectors', [])
+    if not isinstance(bindings, list) or any((not isinstance(uid, str) for uid in bindings)):
+        raise ValueError('Повреждены ссылки на контуры области деформации.')
+    for key in ('pins', 'selected'):
+        indices = interactive.get(key, [])
+        if not isinstance(indices, list) or len(indices) > 100000:
+            raise ValueError('Некорректный список вершин Mesh Edit.')
+        if any((type(i) is not int or i < 0 or (not has_vertices) or (i >= len(arrays['mesh_vertices'])) for i in indices)):
+            raise ValueError('Mesh Edit ссылается на отсутствующие вершины.')
+    options = interactive.get('options', {})
+    if not isinstance(options, dict):
+        raise ValueError('Повреждены параметры деформации.')
+    for key, low, high in [('radius', 0.01, 10000), ('strength', 0, 2), ('gain', 0.001, 10), ('feather', 0.01, 1000)]:
+        if key in options:
+            _project_number(options[key], key, low, high)
+    for key in ('fixed', 'use_mask', 'soft'):
+        if key in options and type(options[key]) is not bool:
+            raise ValueError('Некорректный переключатель деформации.')
+    for key in ('selection_kind', 'drag_axis'):
+        if key in options:
+            _project_number(options[key], key, 0, 2, integer=True)
+    if options.get('target', 'relief') not in ('relief', 'mesh') or options.get('surface_mode', 'local') not in ('local', 'full'):
+        raise ValueError('Неизвестный режим Interactive Relief Manipulation.')
+    if 'mesh_delta' in options:
+        _project_point(options['mesh_delta'], 3, 'смещение сетки')
+        if any((abs(x) > 100000 for x in options['mesh_delta'])):
+            raise ValueError('Слишком большое смещение сетки.')
 
-def pack_project(path, meta, photo=None, photo_name=None, arrays=None):
+def pack_project(path, meta, photo=None, photo_name=None, arrays=None, progress=None):
     arrays = {key: np.asarray(value) for key, value in (arrays or {}).items()}
     validate_project_payload(meta, arrays)
+    if sum((v.nbytes for v in arrays.values())) > MAX_ARRAY_BYTES:
+        raise ValueError('Геометрия проекта больше 256 МиБ. Уменьшите разрешение или размер сетки.')
     meta = dict(meta, format=FORMAT, version=VERSION, photo_file='photo.bin' if photo else None, arrays=sorted(arrays), photo_name=os.path.basename(photo_name or 'photo.png'))
+    metadata = json.dumps(meta, ensure_ascii=False, allow_nan=False).encode('utf-8')
+    if len(metadata) > MAX_METADATA_BYTES:
+        raise ValueError('Метаданные проекта больше 8 МиБ. Разделите векторный рисунок на проекты.')
+    total = sum((v.nbytes for v in arrays.values())) + len(photo or b'') + len(metadata)
+    done = 0
+
+    def write_chunks(stream, data):
+        nonlocal done
+        view = memoryview(data).cast('B')
+        for start in range(0, len(view), 1024 ** 2):
+            if progress:
+                progress(done, total)
+            part = view[start:start + 1024 ** 2]
+            stream.write(part)
+            done += len(part)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(prefix='.' + os.path.basename(path) + '.', suffix='.tmp', dir=os.path.dirname(os.path.abspath(path)), delete=False) as stream:
             temporary = stream.name
-            with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr('project.json', json.dumps(meta, ensure_ascii=False, allow_nan=False))
+            with zipfile.ZipFile(stream, 'w', zipfile.ZIP_STORED) as archive:
+                archive.writestr('project.json', metadata)
                 if photo:
-                    archive.writestr(meta['photo_file'], photo)
+                    with archive.open(meta['photo_file'], 'w', force_zip64=True) as target:
+                        write_chunks(target, photo)
                 if arrays:
-                    buffer = io.BytesIO()
-                    np.savez_compressed(buffer, **arrays)
-                    archive.writestr('arrays.npz', buffer.getvalue())
+                    with archive.open('arrays.npz', 'w', force_zip64=True) as target:
+                        with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as payload:
+                            for key, array in arrays.items():
+                                array = np.ascontiguousarray(array)
+                                with payload.open(key + '.npy', 'w', force_zip64=True) as member:
+                                    np.lib.format.write_array_header_2_0(member, dict(descr=np.lib.format.dtype_to_descr(array.dtype), fortran_order=False, shape=array.shape))
+                                    write_chunks(member, array)
+            if progress:
+                progress(total, total)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -621,19 +918,56 @@ def pack_project(path, meta, photo=None, photo_name=None, arrays=None):
         if temporary is not None:
             os.unlink(temporary)
 
+def _project_zip_budget(archive, limit, members=32):
+    infos = archive.infolist()
+    if len(infos) > members or len({x.filename for x in infos}) != len(infos):
+        raise ValueError('В архиве проекта слишком много или повторяются записи. Файл не открыт.')
+    if sum((x.file_size for x in infos)) > limit or any((x.flag_bits & 1 for x in infos)):
+        raise ValueError('Превышен безопасный объём распаковки проекта или архив зашифрован.')
+
 def unpack_project(path):
+    if os.path.getsize(path) > MAX_PROJECT_BYTES:
+        raise ValueError('Файл проекта больше 384 МиБ. Используйте проект меньшего размера.')
     with zipfile.ZipFile(path) as archive:
+        _project_zip_budget(archive, MAX_PROJECT_BYTES)
+        if archive.getinfo('project.json').file_size > MAX_METADATA_BYTES:
+            raise ValueError('Метаданные проекта больше 8 МиБ. Открытие отменено.')
         meta = json.loads(archive.read('project.json').decode('utf-8'))
         if not isinstance(meta, dict) or meta.get('format') != FORMAT:
             raise ValueError('Неизвестный формат проекта.')
         version = meta.get('version')
         if type(version) is not int or version < 2 or version > VERSION:
             raise ValueError('Неподдерживаемая версия проекта. Обновите программу.')
-        photo = archive.read(meta['photo_file']) if meta.get('photo_file') else None
+        photo = None
+        if meta.get('photo_file'):
+            if archive.getinfo(meta['photo_file']).file_size > MAX_IMAGE_BYTES:
+                raise ValueError('Фотография в проекте больше 64 МиБ. Открытие отменено.')
+            photo = archive.read(meta['photo_file'])
         arrays = {}
         if meta.get('arrays'):
-            with np.load(io.BytesIO(archive.read('arrays.npz')), allow_pickle=False) as payload:
-                arrays = {key: payload[key] for key in payload.files}
+            if archive.getinfo('arrays.npz').file_size > MAX_ARRAY_BYTES:
+                raise ValueError('Архив геометрии больше 256 МиБ.')
+            with zipfile.ZipFile(io.BytesIO(archive.read('arrays.npz'))) as payload:
+                _project_zip_budget(payload, MAX_ARRAY_BYTES, members=8)
+                descriptors = []
+                for info in payload.infolist():
+                    if info.filename not in ('z.npy', 'mesh_vertices.npy', 'mesh_faces.npy'):
+                        raise ValueError('Неизвестный массив геометрии проекта.')
+                    with payload.open(info) as member:
+                        magic = np.lib.format.read_magic(member)
+                        reader = np.lib.format.read_array_header_1_0 if magic == (1, 0) else np.lib.format.read_array_header_2_0
+                        if magic not in ((1, 0), (2, 0)):
+                            raise ValueError('Неподдерживаемый заголовок массива проекта.')
+                        shape, fortran, dtype = reader(member, max_header_size=65536)
+                        size = math.prod(shape) * dtype.itemsize
+                        if len(shape) > 2 or dtype.kind not in 'fiu' or dtype.hasobject or (size > MAX_ARRAY_BYTES) or (size != info.file_size - member.tell()):
+                            raise ValueError('Размер или тип массива не соответствует данным. Открытие отменено до выделения памяти.')
+                        descriptors.append((info, size))
+                if sum((size for _, size in descriptors)) > MAX_ARRAY_BYTES:
+                    raise ValueError('Геометрия проекта требует больше 256 МиБ памяти.')
+                for info, _ in descriptors:
+                    with payload.open(info) as member:
+                        arrays[info.filename[:-4]] = np.load(member, allow_pickle=False, max_header_size=65536)
             if sorted(arrays) != sorted(meta['arrays']):
                 raise ValueError('Список геометрии проекта не совпадает с данными.')
     validate_project_payload(meta, arrays)
@@ -659,7 +993,6 @@ import zipfile
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 LANCZOS = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS')
-Image.MAX_IMAGE_PIXELS = None
 
 class Node:
     __slots__ = ('x', 'y', 'hin', 'hout')
@@ -1000,21 +1333,8 @@ def reduce_for_display(z, mask=None, max_side=1400, max_verts=600000):
     return (z[np.ix_(iy, ix)], None if mask is None else mask[np.ix_(iy, ix)])
 
 def write_stl(path, verts, faces):
-    """Двоичный STL (единицы — мм), запись порциями."""
-    verts = np.asarray(verts, dtype=np.float32)
-    faces = np.asarray(faces)
-    with open(path, 'wb') as f:
-        f.write(b'Stone Relief Studio Pro'.ljust(80, b' '))
-        f.write(struct.pack('<I', len(faces)))
-        for s0 in range(0, len(faces), 400000):
-            tri = verts[faces[s0:s0 + 400000]]
-            n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-            ln = np.linalg.norm(n, axis=1)
-            ln[ln == 0] = 1
-            n = n / ln[:, None]
-            rec = np.zeros(len(tri), dtype=[('n', '<f4', 3), ('v', '<f4', (3, 3)), ('a', '<u2')])
-            rec['n'], rec['v'] = (n, tri)
-            f.write(rec.tobytes())
+    """Compatibility entry point: keep the API and use the validated atomic writer."""
+    export_indexed_stl(path, verts, faces)
 
 def is_watertight(faces):
     f = np.asarray(faces, dtype=np.int64)
@@ -1416,7 +1736,7 @@ def combine_relief(z, shape, weight, base, mode):
 
 def load_image_any(raw):
     """Открыть практически любое растровое фото → RGB (CMYK, палитра, прозрачность, 16 бит)."""
-    img = Image.open(io.BytesIO(raw))
+    img = open_checked_image(raw)
     img.load()
     try:
         img = ImageOps.exif_transpose(img)
@@ -1428,6 +1748,8 @@ def load_image_any(raw):
         img = Image.alpha_composite(bg, rgba).convert('RGB')
     elif img.mode in ('I;16', 'I;16L', 'I;16B', 'I', 'F'):
         a = np.asarray(img, dtype=np.float64)
+        if not np.isfinite(a).all():
+            raise ValueError('Изображение содержит NaN или бесконечность. Исправьте значения карты высот перед импортом.')
         a = (a - a.min()) / max(a.max() - a.min(), 1e-09) * 255
         img = Image.fromarray(a.astype(np.uint8)).convert('RGB')
     else:
@@ -2796,8 +3118,7 @@ class Studio(QMainWindow):
         if not path:
             return False
         try:
-            with open(path, 'rb') as f:
-                raw = f.read()
+            raw = read_checked_file(path)
             img = load_image_any(raw)
         except Exception as e:
             QMessageBox.critical(self, 'Не удалось открыть фото', f'{path}\n\n{type(e).__name__}: {e}')
@@ -4224,9 +4545,9 @@ class Studio(QMainWindow):
                 raise ExportCancelled()
         try:
             if self.z is not None:
-                report = export_heightmap_stl(path, self.z, self.sp_w.value(), self.sp_h.value(), progress)
+                report = export_heightmap_stl(path, self.z, self.sp_w.value(), self.sp_h.value(), progress, minimum_thickness=self.stl_min_wall.value() if hasattr(self, 'stl_min_wall') else 0.5, precision_tolerance=self.stl_precision.value() if hasattr(self, 'stl_precision') else 0.001)
             else:
-                report = export_indexed_stl(path, self.stl_mesh.vertices, self.stl_mesh.faces, progress)
+                report = export_indexed_stl(path, self.stl_mesh.vertices, self.stl_mesh.faces, progress, precision_tolerance=self.stl_precision.value() if hasattr(self, 'stl_precision') else 0.001)
         except ExportCancelled:
             self.statusBar().showMessage('Экспорт отменён. Существующий STL не изменён.')
             return
@@ -4244,16 +4565,39 @@ class Studio(QMainWindow):
         return dict(w=self.sp_w.value(), h=self.sp_h.value(), base=self.sp_base.value(), depth=self.sp_depth.value(), step=self.sp_step.value(), grid=self.sp_grid.value(), blur=self.sp_blur.value(), invert=self.chk_invert.isChecked(), photo_fade=self.sl_photo.value(), material=self.cb_mat.currentIndex(), bright=self.l_bright.value(), contrast=self.l_contrast.value(), az=self.l_az.value(), el=self.l_el.value(), sun=self.chk_sun.isChecked(), fill=self.chk_fill.isChecked(), level=self.c_level.value())
 
     def _write(self, path):
+        dialog = QProgressDialog('Сохранение проекта…', 'Отмена', 0, 100, self)
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.show()
+        last_update = [0.0]
+
+        def progress(current, total):
+            if dialog.wasCanceled():
+                raise ProjectCancelled()
+            now = time.monotonic()
+            if now - last_update[0] > 0.05 or current == total:
+                last_update[0] = now
+                dialog.setValue(round(99 * current / max(total, 1)))
+                QApplication.processEvents()
+            if dialog.wasCanceled():
+                raise ProjectCancelled()
         try:
             self.cancel_preview()
             meta = {'settings': self._settings(), 'saved': time.strftime('%Y-%m-%d %H:%M:%S'), 'vec': [v.data.to_dict() for v in self.view.vectors()], 'ctrl': [(c.pos().x(), c.pos().y(), c.dh) for c in self.view.ctrl_points()]}
             arrays = {'z': self.z} if self.z is not None else {}
             if self.z is None and self.stl_mesh is not None:
                 arrays = {'mesh_vertices': np.asarray(self.stl_mesh.vertices), 'mesh_faces': np.asarray(self.stl_mesh.faces, dtype=np.int64)}
-            pack_project(path, meta, self.photo_bytes, self.photo_name, arrays)
-        except Exception as ex:
-            QMessageBox.critical(self, 'Ошибка сохранения', str(ex))
+            pack_project(path, meta, self.photo_bytes, self.photo_name, arrays, progress=progress)
+        except ProjectCancelled:
+            self.statusBar().showMessage('Сохранение отменено. Предыдущий файл проекта не изменён.')
             return False
+        except Exception as ex:
+            QMessageBox.critical(self, 'Ошибка сохранения', f'{ex}\nСуществующий файл не заменён. Проверьте свободное место, права записи и ограничения размера проекта.')
+            return False
+        finally:
+            dialog.close()
+            dialog.deleteLater()
         self.project_path = path
         self._saved_sig = self.state_sig()
         self.setWindowTitle(f'{APP} — {os.path.basename(path)}')
@@ -4323,7 +4667,7 @@ class Studio(QMainWindow):
                 import trimesh
                 prepared_mesh = trimesh.Trimesh(vertices=arrays['mesh_vertices'], faces=arrays['mesh_faces'], process=False)
         except Exception as ex:
-            QMessageBox.critical(self, 'Ошибка открытия', str(ex))
+            QMessageBox.critical(self, 'Ошибка открытия', f'{ex}\nТекущий проект не заменён. Проверьте путь и ограничения размера; для повреждённого файла используйте резервную копию.')
             return False
         self._clear_all()
         st = meta.get('settings', {})
@@ -4528,8 +4872,693 @@ def build_book_images(folder):
     save('contour', [(base, 'До: рельеф'), (_big(cs), 'После: контур на уровне 50% высоты')])
     save('light', [(_big(hillshade(h, 45, 75)), 'Высокое солнце: детали плоские'), (_big(hillshade(h, 200, 20)), 'Низкое боковое солнце: тени подчёркивают рельеф')])
     save('files', [(_card(['Проект без имени*', 'Ctrl+S — сохранить']), 'До'), (_card(['лепесток.srelief', 'фото+векторы+рельеф']), 'После: можно продолжить позже')])
+    z = 5 + h
+    target = float(surface_samples(z, [[0, 0]], 100, 100)[0]) + 0.8
+    changed = deform_control_surface(z, [dict(id='demo', x=0, y=0, z=target, pinned=False)], 100, 100, mask=mask, fixed=True, mode='full', radius=15, feather=4)
+    save('interactive', [(base, 'До: исходная резьба'), (_big(hillshade(changed, 45, 40)), 'После: поднятая область с неподвижным краем')])
+    save('mesh_edit', [(_card(['STL: вершины + грани', 'Выбор: ЛКМ / Shift+ЛКМ', 'Синие точки закреплены']), 'Исходная сетка'), (_card(['X/Y/Z — смещение в мм', 'Предпросмотр → Применить', 'Ctrl+Z — вернуть оригинал']), 'Порядок работы')])
     return out
-BOOK = [('draw', 'Рисование вектора', 'Обвести лепесток, лист или орнамент тонкой чёрной линией (прямые и кривые Безье).', ['Кнопка «✎» слева.', 'ЛКМ — поставить точку. Две точки — прямая.', 'Нажать и потянуть — получится гладкий узел с кривой.', 'ПКМ — закончить открытый вектор (он сохранится). Щелчок по первой точке — замкнуть.', 'После завершения программа переходит в режим выделения; Esc отменяет незаконченное.'], ['ЛКМ — точка (тянуть — кривая)', 'ПКМ — закончить открытый', 'Esc — отмена', 'Колесо — масштаб, средняя кнопка — перемещение холста'], 'Обведите лепесток замкнутым вектором — он станет областью деформации.'), ('nodes', 'Узлы и ручки Безье', 'Точная правка формы вектора.', ['Выделите вектор щелчком по линии (Shift или рамка — несколько).', 'Тяните квадратики-узлы и синие ручки.', 'Двойной щелчок по узлу — гладкий/острый.', 'ПКМ по линии — «Добавить узел здесь», по узлу — «Удалить узел».'], ['ЛКМ — тянуть узел/ручку', 'Alt при тяге ручки — независимо от второй', 'ПКМ — меню', 'Delete — удалить'], 'Подгоните контур по краю лепестка, добавляя узлы в изгибах.'), ('segment', 'Удалить участок', 'Убрать часть линии между двумя соседними точками; остальное остаётся независимыми векторами.', ['ПКМ прямо на нужном сегменте.', 'Выберите «Удалить участок».'], ['ПКМ по сегменту — контекстное меню'], 'Замкнутый контур станет открытой линией, открытый — разделится на две части.'), ('fade', 'Осветление фото до белого фона', 'Плавно превратить подложку в белую, не трогая векторы и рельеф.', ['Ползунок над 2D-окном.', '0 — фото, 100 — белый фон.'], ['Только ползунок'], 'Осветлите на 65% и рисуйте мелкие детали, чёрные линии останутся видны.'), ('deform', 'Деформация поверхности', 'Управлять формой всей области: плавный изгиб, волна, вершина, между направляющими, по управляющим точкам.', ['Выделите замкнутый вектор — это область.', 'Выберите вид; задайте высоты сторон/точек; нарисуйте сечение (форму перехода).', '«Закрепить границы» оставляет край; поле «Слияние» — как форма объединяется с рельефом.', 'Для «Между направляющими» выделите два открытых вектора; для точек — поставьте «◉».', 'Перейдите в «Редактирование 3D», нажмите «Предпросмотр», затем «Применить» или «Отмена».'], ['Ctrl+Z / Ctrl+Y — отмена и повтор', 'Остальная поверхность затемняется в предпросмотре'], 'Рисунки справа получены тем же алгоритмом, что и в программе, на учебном лепестке.'), ('editor', 'Редактор формы (F12)', 'Создать форму внутри выделенных замкнутых векторов (округлая, угловая, плато) и объединить её с рельефом; обнулить рельеф внутри или снаружи векторов.', ['Выделите замкнутые векторы и нажмите F12 (Рельефы → Редактор формы).', 'Выберите форму: округлая, угловая или плато; задайте угол (отрицательный — выемка) и начальную высоту.', 'Высота: без ограничений, ограничить по высоте, масштаб по высоте или постоянная высота.', 'Выберите действие: Добавить, Вычитание, По наибольш., По наименьш., Обнул. внутри, Обнул. снаружи.', '«Предпросмотр» показывает результат, «Применить» меняет рельеф, «Сброс» возвращает настройки.'], ['F12 — открыть окно', 'Ctrl+Z — отмена'], 'Округлый лепесток: угол 45°, «Масштаб по высоте» 0,8 мм, действие «Добавить».'), ('sweep', 'Вытягивание по двум направляющим', 'Создать рельеф вытягиванием одного или нескольких сечений вдоль двух направляющих; результат объединяется с рельефом.', ['Нарисуйте открытые векторы: верхнюю и нижнюю направляющие и одно или несколько сечений.', 'Выделите все векторы и нажмите «Верхняя направляющая — Выбор»: первый — верхняя, второй — нижняя, остальные — сечения.', 'Или выбирайте по одному: «Нижняя направляющая», «Граница по Z» (кнопки «Выбор»), «Добавить сечение».', '«Развернуть направляющие» меняет направление, «Переход между сечениями» плавно смешивает сечения.', '«Масштабировать высоту по ширине», «Начальная высота» и «Масштабировать конечную высоту» задают высоту.', 'Выберите «Объединить» (добавить, вычесть, по наибольшему, по наименьшему) и нажмите «Вычислить».'], ['Рельефы → Вытягиваемые профили', 'Сечение идёт от первой точки вектора к последней, вверх — выше'], 'Одно сечение-арка даёт валик вдоль траектории; два сечения с переходом — валик, плавно меняющий форму.'), ('transform', 'Перемещение готового рельефа', 'Сдвинуть, повернуть, масштабировать, копировать, отразить выбранную часть рельефа.', ['Выделите замкнутый вектор.', 'Задайте сдвиг в мм, угол, масштаб.', '«Переместить» или «Копировать в новое место»; «Отразить» — по горизонтали или вертикали.', 'Флажок «вместе со связанными векторами» переносит и контуры.'], ['Ctrl+Z — отмена'], 'Скопируйте лепесток на другое место модели.'), ('contour', 'Векторы по высоте', 'Создать контур по границе заданного уровня рельефа.', ['Вкладка «Контуры по высоте».', 'Задайте уровень в мм (например 7 при высоте 10).', '«Построить контуры» — появятся обычные редактируемые векторы.'], ['—'], 'Уровень 7 мм при высоте 10 мм даёт линию по верхней части.'), ('light', 'Освещение и материалы', 'Менять вид модели светом; STL при этом не меняется.', ['Вкладка «Свет 3D»: материал, яркость, контраст.', 'Солнце: поворот и высота, значок, выключение.', 'Дополнительный свет можно отключить; «Тени» включает тени (медленнее).'], ['ЛКМ — вращать', 'Колесо — масштаб', 'Shift+ЛКМ — сдвиг'], 'Проверяйте рельеф при низком боковом свете — так его увидят на камне.'), ('files', 'Файлы, история и экспорт', 'Сохранение проекта, импорт DXF/SVG, экспорт SVG и STL в мм.', ['Ctrl+S — сохранить проект (фото, векторы, размеры, настройки, геометрия).', 'Ctrl+O — открыть.', 'Файл → Импорт DXF / SVG; Экспорт SVG, Экспорт STL.', 'Толщину основания можно менять в любой момент.'], ['Ctrl+Z / Ctrl+Y', 'F1 — эта книга'], 'Перед экспортом STL смотрите «Замкнутая модель: да».')]
+BOOK = [('interactive', 'Interactive Relief Manipulation', 'Плавный изгиб области контрольными точками без размытия мелкой резьбы.', ['Создайте рельеф и выделите замкнутый контур области в 2D (без контура используется вся плита).', 'Нажмите «Контроль рельефа / Mesh Edit», выберите режим «Рельеф» и включите «Выбирать и тянуть в 3D».', 'Щелчок на поверхности добавляет точку. Тяните существующую точку вверх/вниз или введите её Z в мм.', 'Local действует в радиусе; Full Surface плавно меняет всю область. Фиксация края оставляет внешний ряд точек неподвижным.', 'Кнопка «Закрепить / снять» удерживает высоту выбранной точки. Синяя точка закреплена, золотая свободна.', 'Проверьте предпросмотр и нажмите «Применить». Ctrl+Z отменяет всю применённую деформацию.', 'Не применённый предпросмотр в проект не записывается; контрольные точки сохраняются.'], ['ЛКМ — добавить / выбрать точку', 'Тянуть по вертикали — изменить Z', 'Для вращения выключите выбор и перетаскивание', 'Ctrl+Z / Ctrl+Y — Undo / Redo'], 'На лепестке закрепите основание, поднимите точки верхней части и включите Full Surface с фиксированным краем.'), ('mesh_edit', 'Mesh Edit · исходная сетка X/Y/Z', 'Редактировать STL с нависающими деталями без преобразования в карту высот.', ['Откройте «Контроль рельефа / Mesh Edit» и нажмите «STL как сетка». Единицы файла трактуются как мм.', 'Выберите режим Mesh Edit и вид выделения: вершины, рёбра или грани.', 'Включите выбор мышью. Shift добавляет вершины к выделению; закреплённые вершины не перемещаются.', 'Задайте смещения X/Y/Z в мм, силу и радиус мягкого выделения либо тяните по выбранной оси.', 'Выполните предпросмотр и примените результат. Исходная сетка хранится в истории Undo.', 'После изменения проверяйте STL: перемещение может вызвать самопересечения, которые этот этап полностью не проверяет.', 'Кнопка «Рельеф → сетка» создаёт сетку полного разрешения; Undo возвращает карту высот.'], ['ЛКМ — вершина / ребро / грань', 'Shift+ЛКМ — добавить к выбору', 'Смещения X/Y/Z — в мм', 'Ctrl+Z — вернуть исходную геометрию'], 'Подвиньте край листа по X и Z. Существующие нависающие элементы и треугольные грани сохраняются.'), ('draw', 'Рисование вектора', 'Обвести лепесток, лист или орнамент тонкой чёрной линией (прямые и кривые Безье).', ['Кнопка «✎» слева.', 'ЛКМ — поставить точку. Две точки — прямая.', 'Нажать и потянуть — получится гладкий узел с кривой.', 'ПКМ — закончить открытый вектор (он сохранится). Щелчок по первой точке — замкнуть.', 'После завершения программа переходит в режим выделения; Esc отменяет незаконченное.'], ['ЛКМ — точка (тянуть — кривая)', 'ПКМ — закончить открытый', 'Esc — отмена', 'Колесо — масштаб, средняя кнопка — перемещение холста'], 'Обведите лепесток замкнутым вектором — он станет областью деформации.'), ('nodes', 'Узлы и ручки Безье', 'Точная правка формы вектора.', ['Выделите вектор щелчком по линии (Shift или рамка — несколько).', 'Тяните квадратики-узлы и синие ручки.', 'Двойной щелчок по узлу — гладкий/острый.', 'ПКМ по линии — «Добавить узел здесь», по узлу — «Удалить узел».'], ['ЛКМ — тянуть узел/ручку', 'Alt при тяге ручки — независимо от второй', 'ПКМ — меню', 'Delete — удалить'], 'Подгоните контур по краю лепестка, добавляя узлы в изгибах.'), ('segment', 'Удалить участок', 'Убрать часть линии между двумя соседними точками; остальное остаётся независимыми векторами.', ['ПКМ прямо на нужном сегменте.', 'Выберите «Удалить участок».'], ['ПКМ по сегменту — контекстное меню'], 'Замкнутый контур станет открытой линией, открытый — разделится на две части.'), ('fade', 'Осветление фото до белого фона', 'Плавно превратить подложку в белую, не трогая векторы и рельеф.', ['Ползунок над 2D-окном.', '0 — фото, 100 — белый фон.'], ['Только ползунок'], 'Осветлите на 65% и рисуйте мелкие детали, чёрные линии останутся видны.'), ('deform', 'Деформация поверхности', 'Управлять формой всей области: плавный изгиб, волна, вершина, между направляющими, по управляющим точкам.', ['Выделите замкнутый вектор — это область.', 'Выберите вид; задайте высоты сторон/точек; нарисуйте сечение (форму перехода).', '«Закрепить границы» оставляет край; поле «Слияние» — как форма объединяется с рельефом.', 'Для «Между направляющими» выделите два открытых вектора; для точек — поставьте «◉».', 'Перейдите в «Редактирование 3D», нажмите «Предпросмотр», затем «Применить» или «Отмена».'], ['Ctrl+Z / Ctrl+Y — отмена и повтор', 'Остальная поверхность затемняется в предпросмотре'], 'Рисунки справа получены тем же алгоритмом, что и в программе, на учебном лепестке.'), ('editor', 'Редактор формы (F12)', 'Создать форму внутри выделенных замкнутых векторов (округлая, угловая, плато) и объединить её с рельефом; обнулить рельеф внутри или снаружи векторов.', ['Выделите замкнутые векторы и нажмите F12 (Рельефы → Редактор формы).', 'Выберите форму: округлая, угловая или плато; задайте угол (отрицательный — выемка) и начальную высоту.', 'Высота: без ограничений, ограничить по высоте, масштаб по высоте или постоянная высота.', 'Выберите действие: Добавить, Вычитание, По наибольш., По наименьш., Обнул. внутри, Обнул. снаружи.', '«Предпросмотр» показывает результат, «Применить» меняет рельеф, «Сброс» возвращает настройки.'], ['F12 — открыть окно', 'Ctrl+Z — отмена'], 'Округлый лепесток: угол 45°, «Масштаб по высоте» 0,8 мм, действие «Добавить».'), ('sweep', 'Вытягивание по двум направляющим', 'Создать рельеф вытягиванием одного или нескольких сечений вдоль двух направляющих; результат объединяется с рельефом.', ['Нарисуйте открытые векторы: верхнюю и нижнюю направляющие и одно или несколько сечений.', 'Выделите все векторы и нажмите «Верхняя направляющая — Выбор»: первый — верхняя, второй — нижняя, остальные — сечения.', 'Или выбирайте по одному: «Нижняя направляющая», «Граница по Z» (кнопки «Выбор»), «Добавить сечение».', '«Развернуть направляющие» меняет направление, «Переход между сечениями» плавно смешивает сечения.', '«Масштабировать высоту по ширине», «Начальная высота» и «Масштабировать конечную высоту» задают высоту.', 'Выберите «Объединить» (добавить, вычесть, по наибольшему, по наименьшему) и нажмите «Вычислить».'], ['Рельефы → Вытягиваемые профили', 'Сечение идёт от первой точки вектора к последней, вверх — выше'], 'Одно сечение-арка даёт валик вдоль траектории; два сечения с переходом — валик, плавно меняющий форму.'), ('transform', 'Перемещение готового рельефа', 'Сдвинуть, повернуть, масштабировать, копировать, отразить выбранную часть рельефа.', ['Выделите замкнутый вектор.', 'Задайте сдвиг в мм, угол, масштаб.', '«Переместить» или «Копировать в новое место»; «Отразить» — по горизонтали или вертикали.', 'Флажок «вместе со связанными векторами» переносит и контуры.'], ['Ctrl+Z — отмена'], 'Скопируйте лепесток на другое место модели.'), ('contour', 'Векторы по высоте', 'Создать контур по границе заданного уровня рельефа.', ['Вкладка «Контуры по высоте».', 'Задайте уровень в мм (например 7 при высоте 10).', '«Построить контуры» — появятся обычные редактируемые векторы.'], ['—'], 'Уровень 7 мм при высоте 10 мм даёт линию по верхней части.'), ('light', 'Освещение и материалы', 'Менять вид модели светом; STL при этом не меняется.', ['Вкладка «Свет 3D»: материал, яркость, контраст.', 'Солнце: поворот и высота, значок, выключение.', 'Дополнительный свет можно отключить; «Тени» включает тени (медленнее).'], ['ЛКМ — вращать', 'Колесо — масштаб', 'Shift+ЛКМ — сдвиг'], 'Проверяйте рельеф при низком боковом свете — так его увидят на камне.'), ('files', 'Файлы, история и экспорт', 'Сохранение проекта, импорт DXF/SVG, экспорт SVG и STL в мм.', ['Ctrl+S — сохранить проект (фото, векторы, размеры, настройки, геометрия).', 'Ctrl+O — открыть.', 'Файл → Импорт DXF / SVG; Экспорт SVG, Экспорт STL.', 'Толщину основания можно менять в любой момент.'], ['Ctrl+Z / Ctrl+Y', 'F1 — эта книга'], 'Перед экспортом STL смотрите «Замкнутая модель: да».')]
+
+# ==================== interactive_tools ====================
+
+import copy
+import hashlib
+import json
+import threading
+import uuid
+import numpy as np
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
+from PySide6.QtWidgets import QWidget, QFormLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox, QComboBox, QListWidget, QScrollArea, QMessageBox, QFileDialog
+from vtkmodules.vtkInteractionStyle import vtkInteractorStyleUser
+from vtkmodules.vtkRenderingCore import vtkCellPicker
+
+class ManipulationJob(QThread):
+    result_ready = Signal(object)
+    progress_ready = Signal(object)
+
+    def __init__(self, generation, function, arguments, parent):
+        super().__init__(parent)
+        self.generation, self.function, self.arguments = (generation, function, arguments)
+        self.cancelled = threading.Event()
+
+    def run(self):
+
+        def progress(current, total):
+            if self.cancelled.is_set():
+                raise ManipulationCancelled()
+            self.progress_ready.emit((self.generation, current, total))
+        try:
+            result = self.function(**self.arguments, progress=progress)
+            if self.cancelled.is_set():
+                raise ManipulationCancelled()
+            payload = (self.generation, result, None)
+        except ManipulationCancelled:
+            payload = (self.generation, None, 'cancelled')
+        except Exception as error:
+            payload = (self.generation, None, str(error))
+        self.result_ready.emit(payload)
+
+class ManipulationBridge(QObject):
+    """Explicit QObject slots keep all widget/VTK calls on the GUI thread."""
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+
+    @Slot(object)
+    def result(self, payload):
+        self.owner._irm_receive_result(payload)
+
+    @Slot(object)
+    def progress(self, payload):
+        generation, current, total = payload
+        if generation == self.owner._irm_generation:
+            self.owner.irm_status.setText(f'Расчёт: {round(100 * current / max(total, 1))}% · можно отменить')
+
+class InteractiveManipulationMixin:
+
+    def __init__(self, *args, **kwargs):
+        self._irm_controls = []
+        self._irm_pins = set()
+        self._irm_selected = set()
+        self._irm_mask_uids = []
+        self._irm_options = {}
+        self._irm_job = None
+        self._irm_generation = 0
+        self._irm_result = None
+        self._irm_drag = None
+        self._irm_overlay = []
+        self._irm_enabled = False
+        self._irm_token = None
+        super().__init__(*args, **kwargs)
+
+    def _install_manipulation(self):
+        self._irm_bridge = ManipulationBridge(self)
+        self._irm_timer = QTimer(self)
+        self._irm_timer.setSingleShot(True)
+        self._irm_timer.timeout.connect(self._irm_start_preview)
+        page = QWidget()
+        form = QFormLayout(page)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self._irm_form = form
+        intro = QLabel('Interactive Relief Manipulation\nРельеф: щелчок создаёт точку; тяните точку вверх/вниз для изменения Z. Закреплённые точки неподвижны.\nZ отсчитывается от дна: при основании 5 мм ноль рельефа — Z=5 мм.\nСетка: выбирайте вершины, рёбра или грани; смещения X/Y/Z сохраняют нависающую геометрию. Shift — добавить к выделению.')
+        intro.setWordWrap(True)
+        form.addRow(intro)
+        self.irm_target = QComboBox()
+        self.irm_target.addItem('Рельеф · контрольные точки', 'relief')
+        self.irm_target.addItem('Mesh Edit · X/Y/Z', 'mesh')
+        form.addRow('Режим', self.irm_target)
+        row = QHBoxLayout()
+        for label, slot in [('STL как сетка…', self.open_stl_mesh), ('Рельеф → сетка', self.relief_to_mesh)]:
+            button = QPushButton(label)
+            button.clicked.connect(slot)
+            row.addWidget(button)
+        form.addRow(row)
+        self.irm_enable_button = QPushButton('Выбирать и тянуть в 3D')
+        self.irm_enable_button.setCheckable(True)
+        self.irm_enable_button.toggled.connect(self._irm_toggle)
+        form.addRow(self.irm_enable_button)
+        self.irm_selection_kind = QComboBox()
+        self.irm_selection_kind.addItems(['Вершины', 'Рёбра', 'Грани'])
+        form.addRow('Выбор в сетке', self.irm_selection_kind)
+        self.irm_list = QListWidget()
+        self.irm_list.setMaximumHeight(140)
+        self.irm_list.currentRowChanged.connect(self._irm_sync_point_fields)
+        form.addRow(self.irm_list)
+        self.irm_z = self._spin(5, 0.05, 100000, 4, ' мм', 0.1)
+        self._irm_z_dirty = False
+        self.irm_z.valueChanged.connect(self._irm_mark_z_edit)
+        self.irm_z.editingFinished.connect(self._irm_numeric_point)
+        form.addRow('Z точки / поверхности', self.irm_z)
+        for label, slot in [('Закрепить / снять', self._irm_pin), ('Удалить точку', self._irm_delete_point), ('Снять выделение', self._irm_clear_selection)]:
+            button = QPushButton(label)
+            button.clicked.connect(slot)
+            form.addRow(button)
+            if slot == self._irm_delete_point:
+                self.irm_delete_button = button
+        self.irm_surface_mode = QComboBox()
+        self.irm_surface_mode.addItem('Local Deformation', 'local')
+        self.irm_surface_mode.addItem('Full Surface', 'full')
+        self.irm_radius = self._spin(15, 0.01, 10000, 3, ' мм', 1)
+        self.irm_strength = self._spin(1, 0, 2, 3, '', 0.05)
+        self.irm_gain = self._spin(0.05, 0.001, 10, 3, ' мм/px', 0.01)
+        self.irm_feather = self._spin(3, 0.01, 1000, 3, ' мм', 0.5)
+        self.irm_fixed = QCheckBox('Закрепить границу области')
+        self.irm_fixed.setChecked(True)
+        self.irm_mask = QCheckBox('Ограничить выбранными контурами 2D')
+        self.irm_mask.setChecked(True)
+        self.irm_mask.setToolTip('Контуры области запоминаются в проекте. Для смены области выделите другие замкнутые векторы. Для всей плиты отключите ограничение.')
+        for label, widget in [('Деформация', self.irm_surface_mode), ('Радиус / мягкий выбор', self.irm_radius), ('Сила (1 = заданная высота)', self.irm_strength), ('Перетаскивание', self.irm_gain), ('Плавность края', self.irm_feather)]:
+            form.addRow(label, widget)
+        form.addRow(self.irm_fixed)
+        form.addRow(self.irm_mask)
+        self.irm_dx, self.irm_dy, self.irm_dz = [self._spin(0, -100000, 100000, 4, ' мм', 0.1) for _ in range(3)]
+        for label, widget in [('Сетка: смещение X', self.irm_dx), ('Смещение Y', self.irm_dy), ('Смещение Z', self.irm_dz)]:
+            form.addRow(label, widget)
+        self.irm_soft = QCheckBox('Мягкое пропорциональное выделение')
+        self.irm_soft.setChecked(True)
+        form.addRow(self.irm_soft)
+        self.irm_drag_axis = QComboBox()
+        self.irm_drag_axis.addItems(['Z', 'X', 'Y'])
+        form.addRow('Тянуть в сетке по оси', self.irm_drag_axis)
+        row = QHBoxLayout()
+        self.irm_preview_button = QPushButton('Предпросмотр')
+        self.irm_preview_button.clicked.connect(self._irm_start_preview)
+        self.irm_apply_button = QPushButton('Применить')
+        self.irm_apply_button.setProperty('primary', True)
+        self.irm_apply_button.setEnabled(False)
+        self.irm_apply_button.clicked.connect(self._irm_apply)
+        cancel = QPushButton('Отменить просмотр')
+        cancel.clicked.connect(self._irm_cancel)
+        for button in (self.irm_preview_button, self.irm_apply_button):
+            row.addWidget(button)
+        form.addRow(row)
+        form.addRow(cancel)
+        self.irm_status = QLabel('Изменения применяются только кнопкой «Применить». Один результат — один шаг Undo.')
+        self.irm_status.setWordWrap(True)
+        form.addRow(self.irm_status)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        self.irm_tab = self.inspector_tabs.addTab(scroll, 'Контроль 3D')
+        self.irm_action = self._action('Контроль рельефа / Mesh Edit', 'point', lambda: self.show_inspector(self.irm_tab))
+        for toolbar in self.findChildren(type(self.snapbar)):
+            if toolbar.windowTitle() == 'Создание и редактирование рельефа':
+                toolbar.addAction(self.irm_action)
+        for menu in self.menuBar().findChildren(type(self.recent_menu)):
+            if menu.title() == 'Рельефы':
+                menu.addAction(self.irm_action)
+        self.irm_target.currentIndexChanged.connect(self._irm_target_changed)
+        interactor = self.plotter.iren.interactor
+        for event, callback in [('LeftButtonPressEvent', self._irm_press), ('MouseMoveEvent', self._irm_move), ('LeftButtonReleaseEvent', self._irm_release)]:
+            interactor.AddObserver(event, callback, 1.1)
+        self._irm_restore_state(self._irm_state())
+
+    def _irm_update_rows(self):
+        relief = self.irm_target.currentData() == 'relief'
+        groups = [(relief, [self.irm_z, self.irm_delete_button, self.irm_surface_mode, self.irm_feather, self.irm_fixed, self.irm_mask]), (not relief, [self.irm_selection_kind, self.irm_dx, self.irm_dy, self.irm_dz, self.irm_soft, self.irm_drag_axis])]
+        for visible, widgets in groups:
+            for widget in widgets:
+                widget.setVisible(visible)
+                label = self._irm_form.labelForField(widget)
+                if label is not None:
+                    label.setVisible(visible)
+
+    def _irm_state(self):
+        options = dict(self._irm_options)
+        if hasattr(self, 'irm_target'):
+            options.update(target=self.irm_target.currentData(), surface_mode=self.irm_surface_mode.currentData(), radius=self.irm_radius.value(), strength=self.irm_strength.value(), gain=self.irm_gain.value(), feather=self.irm_feather.value(), fixed=self.irm_fixed.isChecked(), use_mask=self.irm_mask.isChecked(), mesh_delta=[self.irm_dx.value(), self.irm_dy.value(), self.irm_dz.value()], soft=self.irm_soft.isChecked(), selection_kind=self.irm_selection_kind.currentIndex(), drag_axis=self.irm_drag_axis.currentIndex())
+        bindings = list(self._irm_mask_uids)
+        if self._irm_controls and options.get('use_mask', True) and hasattr(self, 'view'):
+            selected = [v.data.uid for v in self.sel_vectors() if v.data.closed]
+            if selected:
+                bindings = selected
+        return dict(controls=copy.deepcopy(self._irm_controls), pins=sorted(self._irm_pins), selected=sorted(self._irm_selected), mask_vectors=bindings, options=options)
+
+    def _irm_restore_state(self, state):
+        self._irm_controls = copy.deepcopy(state.get('controls', []))
+        self._irm_pins = set(state.get('pins', []))
+        self._irm_selected = set(state.get('selected', []))
+        self._irm_options = dict(state.get('options', {}))
+        self._irm_mask_uids = list(state.get('mask_vectors', []))
+        if not hasattr(self, 'irm_target'):
+            return
+        for key, widget in [('radius', self.irm_radius), ('strength', self.irm_strength), ('gain', self.irm_gain), ('feather', self.irm_feather)]:
+            widget.blockSignals(True)
+            widget.setValue(self._irm_options.get(key, widget.value()))
+            widget.blockSignals(False)
+        for key, widget in [('fixed', self.irm_fixed), ('use_mask', self.irm_mask)]:
+            widget.setChecked(self._irm_options.get(key, True))
+        for key, widget, default in [('target', self.irm_target, 'relief'), ('surface_mode', self.irm_surface_mode, 'local')]:
+            widget.blockSignals(True)
+            widget.setCurrentIndex(max(0, widget.findData(self._irm_options.get(key, default))))
+            widget.blockSignals(False)
+        for widget, value in zip((self.irm_dx, self.irm_dy, self.irm_dz), self._irm_options.get('mesh_delta', [0, 0, 0])):
+            widget.setValue(value)
+        self.irm_soft.setChecked(self._irm_options.get('soft', True))
+        self.irm_selection_kind.setCurrentIndex(self._irm_options.get('selection_kind', 0))
+        self.irm_drag_axis.setCurrentIndex(self._irm_options.get('drag_axis', 0))
+        self._irm_update_rows()
+        self._irm_refresh_list()
+
+    def _settings(self):
+        return dict(super()._settings(), interactive=self._irm_state())
+
+    def after_change(self):
+        if self.stl_mesh is None:
+            self._irm_pins.clear()
+            self._irm_selected.clear()
+        return super().after_change()
+
+    def state_sig(self):
+        return hashlib.sha256((super().state_sig() + json.dumps(self._irm_state(), sort_keys=True)).encode()).hexdigest()
+
+    def snapshot(self):
+        return dict(super().snapshot(), interactive=self._irm_state())
+
+    def restore(self, state):
+        self._irm_cancel(silent=True)
+        self._irm_restore_state(state.get('interactive', {}))
+        super().restore(state)
+        if self.z is None and self.stl_mesh is not None:
+            self.show_mesh()
+        self._irm_refresh_overlay()
+
+    def _clear_all(self):
+        self._irm_cancel(silent=True)
+        if hasattr(self, 'irm_enable_button'):
+            self.irm_enable_button.setChecked(False)
+        self._irm_restore_state({})
+        super()._clear_all()
+
+    def _write(self, path):
+        self._irm_release()
+        return super()._write(path)
+
+    def confirm_discard(self):
+        self._irm_release()
+        self._irm_cancel(silent=False)
+        if self._irm_job is not None and self._irm_job.isRunning():
+            self._irm_job.cancelled.set()
+            if not self._irm_job.wait(3000):
+                self.statusBar().showMessage('Дождитесь завершения отмены расчёта перед закрытием.')
+                return False
+        return super().confirm_discard()
+
+    def cancel_preview(self, silent=False):
+        self._irm_cancel(silent=silent)
+        return super().cancel_preview(silent)
+
+    def show_mesh(self, *args, **kwargs):
+        result = super().show_mesh(*args, **kwargs)
+        if hasattr(self, 'irm_target'):
+            self._irm_refresh_overlay()
+        return result
+
+    def _irm_target_changed(self, *_):
+        if self._irm_enabled:
+            self.irm_enable_button.setChecked(False)
+        self._irm_update_rows()
+        self._irm_cancel()
+        self._irm_refresh_list()
+
+    def _irm_toggle(self, enabled):
+        self._irm_release()
+        if enabled:
+            if self.irm_target.currentData() == 'relief' and self.z is None or (self.irm_target.currentData() == 'mesh' and self.stl_mesh is None):
+                self.irm_enable_button.setChecked(False)
+                self.irm_status.setText('Создайте рельеф или откройте STL кнопкой «STL как сетка».')
+                return
+            if self.sculpt_action.isChecked():
+                self.sculpt_action.setChecked(False)
+                self.toggle_sculpt(False)
+            self._irm_camera_style = self.plotter.iren.interactor.GetInteractorStyle()
+            self._irm_style = vtkInteractorStyleUser()
+            self.plotter.iren.interactor.SetInteractorStyle(self._irm_style)
+            self.tabs.setCurrentIndex(1)
+            self.show_inspector(self.irm_tab)
+        elif hasattr(self, '_irm_camera_style'):
+            self.plotter.iren.interactor.SetInteractorStyle(self._irm_camera_style)
+        self._irm_enabled = enabled
+        self._irm_refresh_overlay()
+
+    def _irm_refresh_list(self, selected=None):
+        if not hasattr(self, 'irm_list'):
+            return
+        current = self.irm_list.currentRow() if selected is None else selected
+        self.irm_list.blockSignals(True)
+        self.irm_list.clear()
+        if self.irm_target.currentData() == 'relief':
+            for i, point in enumerate(self._irm_controls):
+                self.irm_list.addItem(f"{i + 1}. Z {point['z']:.4f} мм" + (' · закреплена' if point.get('pinned') else ''))
+        else:
+            self.irm_list.addItem(f'Выбрано вершин: {len(self._irm_selected)}; закреплено: {len(self._irm_pins)}')
+        self.irm_list.setCurrentRow(min(max(current, 0), self.irm_list.count() - 1))
+        self.irm_list.blockSignals(False)
+        self._irm_sync_point_fields(self.irm_list.currentRow())
+        self._irm_refresh_overlay()
+
+    def _irm_sync_point_fields(self, row):
+        valid = self.irm_target.currentData() == 'relief' and 0 <= row < len(self._irm_controls)
+        self.irm_z.setEnabled(valid and (not self._irm_controls[row].get('pinned')))
+        if valid:
+            self.irm_z.blockSignals(True)
+            self.irm_z.setValue(self._irm_controls[row]['z'])
+            self.irm_z.blockSignals(False)
+        self._irm_z_dirty = False
+
+    def _irm_mark_z_edit(self, *_):
+        self._irm_z_dirty = True
+
+    def _irm_numeric_point(self):
+        if not self._irm_z_dirty:
+            return
+        self._irm_z_dirty = False
+        row = self.irm_list.currentRow()
+        if self.irm_target.currentData() != 'relief' or not 0 <= row < len(self._irm_controls):
+            return
+        point = self._irm_controls[row]
+        if point.get('pinned') or point['z'] == self.irm_z.value():
+            return
+        snap = self.snapshot()
+        point['z'] = self.irm_z.value()
+        self.push_history('Высота контрольной точки', snap)
+        self._irm_refresh_list(row)
+        self._irm_schedule_preview()
+
+    def _irm_pin(self):
+        snap = self.snapshot()
+        if self.irm_target.currentData() == 'mesh':
+            if not self._irm_selected:
+                return
+            if self._irm_selected <= self._irm_pins:
+                self._irm_pins -= self._irm_selected
+            else:
+                self._irm_pins |= self._irm_selected
+        else:
+            row = self.irm_list.currentRow()
+            if not 0 <= row < len(self._irm_controls):
+                return
+            point = self._irm_controls[row]
+            point['pinned'] = not point.get('pinned')
+        self.push_history('Закрепление контрольных точек', snap)
+        self._irm_refresh_list()
+        self._irm_schedule_preview()
+
+    def _irm_delete_point(self):
+        row = self.irm_list.currentRow()
+        if self.irm_target.currentData() != 'relief' or not 0 <= row < len(self._irm_controls):
+            return
+        snap = self.snapshot()
+        self._irm_controls.pop(row)
+        self.push_history('Удаление контрольной точки', snap)
+        self._irm_cancel()
+        self._irm_refresh_list()
+
+    def _irm_clear_selection(self):
+        self._irm_selected.clear()
+        self.irm_list.setCurrentRow(-1)
+        self._irm_refresh_overlay()
+
+    def _irm_refresh_overlay(self):
+        if not hasattr(self, 'plotter') or not hasattr(self, 'irm_target'):
+            return
+        for actor in self._irm_overlay:
+            try:
+                self.plotter.remove_actor(actor, render=False)
+            except (RuntimeError, AttributeError):
+                pass
+        self._irm_overlay = []
+        if not self._irm_enabled:
+            return
+        import pyvista as pv
+        if self.irm_target.currentData() == 'relief':
+            groups = [([p for p in self._irm_controls if p.get('pinned')], '#69b8ed'), ([p for p in self._irm_controls if not p.get('pinned')], '#f1b04c')]
+            for points, color in groups:
+                if points:
+                    xyz = np.array([[p['x'], p['y'], p['z']] for p in points])
+                    self._irm_overlay.append(self.plotter.add_mesh(pv.PolyData(xyz), color=color, point_size=15, render_points_as_spheres=True, lighting=False, pickable=False, reset_camera=False, render=False))
+        elif self.stl_mesh is not None:
+            vertices = self._irm_result[1].vertices if self._irm_result is not None and self._irm_result[0] == 'mesh' else self.stl_mesh.vertices
+            for indices, color in [(self._irm_pins, '#69b8ed'), (self._irm_selected, '#f1b04c')]:
+                valid = [i for i in indices if 0 <= i < len(vertices)]
+                if valid:
+                    self._irm_overlay.append(self.plotter.add_mesh(pv.PolyData(vertices[valid]), color=color, point_size=13, render_points_as_spheres=True, lighting=False, pickable=False, reset_camera=False, render=False))
+
+    def _irm_press(self, *_):
+        if not self._irm_enabled:
+            return
+        self._irm_release()
+        interactor = self.plotter.iren.interactor
+        x, y = interactor.GetEventPosition()
+        if self.irm_target.currentData() == 'relief':
+            renderer = self.plotter.renderer
+            closest = None
+            for i, point in enumerate(self._irm_controls):
+                renderer.SetWorldPoint(point['x'], point['y'], point['z'], 1)
+                renderer.WorldToDisplay()
+                sx, sy, _ = renderer.GetDisplayPoint()
+                distance = (sx - x) ** 2 + (sy - y) ** 2
+                if distance < 18 ** 2 and (closest is None or distance < closest[0]):
+                    closest = (distance, i)
+            if closest is not None:
+                row = closest[1]
+                self.irm_list.setCurrentRow(row)
+                if not self._irm_controls[row].get('pinned'):
+                    self._irm_drag = dict(row=row, y=y, z=self._irm_controls[row]['z'], snapshot=self.snapshot())
+                return
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.005)
+        picker.PickFromListOn()
+        if self.actor is None:
+            return
+        picker.AddPickList(self.actor)
+        if not picker.Pick(x, y, 0, self.plotter.renderer):
+            return
+        position = np.asarray(picker.GetPickPosition())
+        if self.irm_target.currentData() == 'relief' and self.z is not None:
+            if len(self._irm_controls) >= 128:
+                self.irm_status.setText('Достигнут предел 128 точек.')
+                return
+            if abs(position[0]) > self.sp_w.value() / 2 or abs(position[1]) > self.sp_h.value() / 2:
+                return
+            snap = self.snapshot()
+            position[2] = surface_samples(self.z, [position[:2]], self.sp_w.value(), self.sp_h.value())[0]
+            self._irm_controls.append(dict(id=uuid.uuid4().hex, x=float(position[0]), y=float(position[1]), z=float(position[2]), pinned=False))
+            self.push_history('Контрольная точка на поверхности', snap)
+            row = len(self._irm_controls) - 1
+            self._irm_refresh_list(row)
+            self._irm_drag = dict(row=row, y=y, z=float(position[2]), snapshot=self.snapshot())
+        elif self.stl_mesh is not None:
+            face = picker.GetCellId()
+            if not 0 <= face < len(self.stl_mesh.faces):
+                return
+            ids = np.asarray(self.stl_mesh.faces[face])
+            xyz = np.asarray(self.stl_mesh.vertices[ids])
+            mode = self.irm_selection_kind.currentIndex()
+            if mode == 0:
+                picked = {int(ids[np.argmin(np.linalg.norm(xyz - position, axis=1))])}
+            elif mode == 2:
+                picked = set(map(int, ids))
+            else:
+                pairs = [(0, 1), (1, 2), (2, 0)]
+
+                def distance(pair):
+                    a, b = xyz[list(pair)]
+                    d = b - a
+                    t = np.clip(np.dot(position - a, d) / max(np.dot(d, d), 1e-20), 0, 1)
+                    return np.linalg.norm(position - a - t * d)
+                picked = set(map(int, ids[list(min(pairs, key=distance))]))
+            if not interactor.GetShiftKey():
+                self._irm_selected.clear()
+            self._irm_selected |= picked
+            self._irm_refresh_list()
+            self._irm_drag = dict(y=y, axis=self.irm_drag_axis.currentIndex(), offset=0.0)
+        self.plotter.render()
+
+    def _irm_move(self, *_):
+        if self._irm_drag is None:
+            return
+        _, y = self.plotter.iren.interactor.GetEventPosition()
+        offset = (y - self._irm_drag['y']) * self.irm_gain.value()
+        if self.irm_target.currentData() == 'relief':
+            row = self._irm_drag['row']
+            point = self._irm_controls[row]
+            point['z'] = max(0.05, self._irm_drag['z'] + offset)
+            self._irm_sync_point_fields(row)
+            self._irm_refresh_overlay()
+            self.plotter.render()
+        else:
+            self._irm_drag['offset'] = offset
+            widgets = [self.irm_dz, self.irm_dx, self.irm_dy]
+            widgets[self._irm_drag['axis']].setValue(offset)
+        self._irm_schedule_preview()
+
+    def _irm_release(self, *_):
+        if self._irm_drag is None:
+            return
+        drag, self._irm_drag = (self._irm_drag, None)
+        if 'row' in drag and self._irm_controls[drag['row']]['z'] != drag['z']:
+            self.push_history('Перемещение контрольной точки', drag['snapshot'])
+            self._irm_refresh_list(drag['row'])
+            self._irm_schedule_preview()
+        elif 'axis' in drag and drag['offset'] != 0:
+            self._irm_schedule_preview()
+
+    def _irm_schedule_preview(self):
+        if self._irm_job is not None and self._irm_job.isRunning():
+            self._irm_job.cancelled.set()
+        self._irm_timer.start(180)
+
+    def _irm_start_preview(self):
+        if self._irm_job is not None and self._irm_job.isRunning():
+            self._irm_job.cancelled.set()
+            self._irm_timer.start(100)
+            return
+        self._irm_timer.stop()
+        super().cancel_preview(silent=True)
+        self._irm_result = None
+        self.irm_apply_button.setEnabled(False)
+        target = self.irm_target.currentData()
+        try:
+            if target == 'relief':
+                if self.z is None:
+                    raise ValueError('Создайте карту высот. Для исходного STL выберите Mesh Edit.')
+                mask = None
+                if self.irm_mask.isChecked():
+                    selected = [v for v in self.sel_vectors() if v.data.closed]
+                    if selected:
+                        self._irm_mask_uids = [v.data.uid for v in selected]
+                    if self._irm_mask_uids:
+                        by_uid = {v.data.uid: v for v in self.view.vectors()}
+                        if any((uid not in by_uid for uid in self._irm_mask_uids)):
+                            raise ValueError('Контур сохранённой области удалён. Выделите новую область или отключите ограничение.')
+                        polys = [[self.scene_to_grid(x, y) for x, y in by_uid[uid].scene_points()] for uid in self._irm_mask_uids]
+                        mask = raster_coverage(polys, self.z.shape[1], self.z.shape[0]) > 0.5
+                function = deform_control_surface
+                arguments = dict(z=self.z, controls=copy.deepcopy(self._irm_controls), width=self.sp_w.value(), height=self.sp_h.value(), mask=mask, fixed=self.irm_fixed.isChecked(), mode=self.irm_surface_mode.currentData(), radius=self.irm_radius.value(), strength=self.irm_strength.value(), feather=self.irm_feather.value())
+            else:
+                if self.stl_mesh is None:
+                    raise ValueError('Откройте STL как сетку или скопируйте рельеф в сетку.')
+                function = deform_mesh_vertices
+                arguments = dict(vertices=np.asarray(self.stl_mesh.vertices), selected=list(self._irm_selected), pinned=list(self._irm_pins), delta=[self.irm_dx.value(), self.irm_dy.value(), self.irm_dz.value()], radius=self.irm_radius.value() if self.irm_soft.isChecked() else 0, strength=self.irm_strength.value())
+            self._irm_generation += 1
+            self._irm_token = self.state_sig()
+            self._irm_job_target = target
+            if self._irm_job is not None:
+                self._irm_job.deleteLater()
+            self._irm_job = ManipulationJob(self._irm_generation, function, arguments, self)
+            self._irm_job.result_ready.connect(self._irm_bridge.result, Qt.QueuedConnection)
+            self._irm_job.progress_ready.connect(self._irm_bridge.progress, Qt.QueuedConnection)
+            self.irm_status.setText('Расчёт в рабочем потоке…')
+            self._irm_job.start()
+        except Exception as error:
+            self.irm_status.setText(str(error))
+
+    def _irm_receive_result(self, payload):
+        generation, result, error = payload
+        if generation != self._irm_generation:
+            return
+        if error:
+            self.irm_status.setText('Расчёт отменён; исходная геометрия сохранена.' if error == 'cancelled' else error)
+            return
+        if self.state_sig() != self._irm_token:
+            self.irm_status.setText('Модель или параметры изменились. Повторите предпросмотр.')
+            return
+        if self._irm_job_target == 'mesh':
+            import trimesh
+            result = trimesh.Trimesh(vertices=result, faces=np.asarray(self.stl_mesh.faces).copy(), process=False)
+        self._irm_result = (self._irm_job_target, result)
+        self._irm_draw_preview()
+        self.irm_apply_button.setEnabled(True)
+        self.irm_status.setText('Предпросмотр готов. Исходная геометрия не изменена.' + (' После деформации сетки проверьте замкнутость STL.' if self._irm_job_target == 'mesh' else ''))
+
+    def _irm_draw_preview(self):
+        target, result = self._irm_result
+        if target == 'relief':
+            self.show_mesh(result)
+        else:
+            original = self.stl_mesh
+            try:
+                self.stl_mesh = result
+                self.show_mesh()
+            finally:
+                self.stl_mesh = original
+
+    def _irm_apply(self):
+        self._irm_release()
+        self._irm_timer.stop()
+        if self._irm_result is None or self.state_sig() != self._irm_token:
+            self.irm_status.setText('Сначала выполните актуальный предпросмотр.')
+            return False
+        target, result = self._irm_result
+        snap = self.snapshot()
+        self.push_history('Interactive Relief Manipulation' if target == 'relief' else 'Mesh Edit · X/Y/Z', snap)
+        if target == 'relief':
+            self.z = result
+        else:
+            self.stl_mesh = result
+        self._irm_result = None
+        self.irm_apply_button.setEnabled(False)
+        self.show_mesh()
+        self.after_change()
+        self.irm_status.setText('Применено. Ctrl+Z — отменить всю деформацию.')
+        return True
+
+    def _irm_cancel(self, checked=False, silent=False):
+        if hasattr(self, '_irm_timer'):
+            self._irm_timer.stop()
+        if self._irm_job is not None and self._irm_job.isRunning():
+            self._irm_job.cancelled.set()
+        self._irm_generation += 1
+        had_preview = self._irm_result is not None
+        self._irm_result = None
+        if hasattr(self, 'irm_apply_button'):
+            self.irm_apply_button.setEnabled(False)
+        if had_preview and (not silent):
+            self.show_mesh()
+        if not silent and hasattr(self, 'irm_status'):
+            self.irm_status.setText('Предпросмотр отменён; исходная геометрия сохранена.')
+
+    def open_stl_mesh(self, path=None):
+        if not isinstance(path, str):
+            path, _ = QFileDialog.getOpenFileName(self, 'STL без преобразования в карту высот', '', 'STL (*.stl)')
+        if not path:
+            return False
+        try:
+            import trimesh
+            import io
+            mesh = trimesh.load(io.BytesIO(read_checked_file(path, 256 * 1024 ** 2)), file_type='stl', force='mesh', process=False)
+            vertices, inverse = np.unique(np.asarray(mesh.vertices), axis=0, return_inverse=True)
+            faces = inverse[np.asarray(mesh.faces)]
+            if not len(faces) or not np.isfinite(vertices).all() or np.any(np.ptp(vertices, axis=0) <= 0):
+                raise ValueError('STL пуст, содержит неверные координаты или нулевой объём габаритов.')
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+            if np.any(mesh.extents < 1e-06) or np.any(mesh.extents > 1000000000.0):
+                raise ValueError('Размер STL вне диапазона 0,000001…1e9 мм. Проверьте единицы и масштаб исходной модели.')
+        except Exception as error:
+            QMessageBox.warning(self, 'STL не открыт', str(error))
+            return False
+        self._irm_cancel(silent=True)
+        self._sculpt_release()
+        snap = self.snapshot()
+        self.push_history('Импорт STL как исходной сетки', snap)
+        self.z = None
+        self.stl_mesh = mesh
+        self._irm_restore_state({})
+        for widget, value in ((self.sp_w, float(mesh.extents[0])), (self.sp_h, float(mesh.extents[1]))):
+            widget.blockSignals(True)
+            widget.setDecimals(6)
+            widget.setRange(min(widget.minimum(), value), max(widget.maximum(), value))
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self.irm_target.setCurrentIndex(1)
+        self.show_mesh(reset=True)
+        self.after_change()
+        self.show_inspector(self.irm_tab)
+        self.irm_status.setText('Исходная XYZ-сетка открыта без карты высот. Единицы STL интерпретируются как мм.')
+        return True
+
+    def relief_to_mesh(self):
+        if self.z is None:
+            self.irm_status.setText('Сначала создайте рельеф.')
+            return False
+        import trimesh
+        self._irm_cancel(silent=True)
+        self._sculpt_release()
+        snap = self.snapshot()
+        vertices, faces = build_mesh_arrays(self.z, self.sp_w.value(), self.sp_h.value())
+        self.push_history('Рельеф → Mesh Edit', snap)
+        self.stl_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        self.z = None
+        self._irm_restore_state({})
+        self.irm_target.setCurrentIndex(1)
+        self.show_mesh()
+        self.after_change()
+        self.show_inspector(self.irm_tab)
+        self.irm_status.setText('Создана сетка полного разрешения. Ctrl+Z возвращает исходную карту высот.')
+        return True
 
 # ==================== stone_relief_studio ====================
 
@@ -4590,7 +5619,7 @@ class Ruler(QWidget):
                     painter.drawText(pos + 3, 11, f'{value:g}')
         painter.end()
 
-class StoneStudio(Studio):
+class StoneStudio(InteractiveManipulationMixin, Studio):
 
     def __init__(self):
         self._shape_kind = None
@@ -4613,7 +5642,7 @@ class StoneStudio(Studio):
         super().__init__()
         self.setStyleSheet(STYLE)
         self.setWindowIcon(icon('dome', True))
-        self.setWindowTitle('Stone Relief Studio — векторы и рельеф')
+        self.setWindowTitle('Stone Relief Studio Pro 3.3 — векторы и рельеф')
         self.resize(1440, 940)
         self.sweep_dialog = self._build_sweep_dialog()
         self.relief_dialog = self._build_shape_dialog()
@@ -4630,6 +5659,7 @@ class StoneStudio(Studio):
         self.view.viewport().installEventFilter(self)
         self.view.viewport().setMouseTracking(True)
         self._install_sculpt()
+        self._install_manipulation()
         self._restore_user_preferences()
         self._saved_sig = self.state_sig()
         self.statusBar().showMessage('Векторы — слева. Формы и рельеф — сверху. F12 — редактор формы.')
@@ -4690,8 +5720,16 @@ class StoneStudio(Studio):
             menus['Рельефы'].addAction(actions[key])
         for title, op in [('Масштаб высоты…', 'scale'), ('Инвертировать', 'invert'), ('Смещение высоты…', 'offset')]:
             menus['Рельефы'].addAction(title, lambda op=op: self.relief_op(op))
+        menus['Рельефы'].addAction('Отразить рельеф горизонтально', lambda: self.relief_op('mirror_h'))
+        menus['Рельефы'].addAction('Отразить рельеф вертикально', lambda: self.relief_op('mirror_v'))
         menus['Рельефы'].addAction(actions['stl'])
         menus['Справка'].addAction(self._action('Справочник инструментов', 'new', self.open_help, 'F1'))
+        self.help_button = QToolButton(self.menuBar())
+        self.help_button.setIcon(icon('book', True))
+        self.help_button.setIconSize(QSize(24, 24))
+        self.help_button.setToolTip('Книга инструментов на русском · F1')
+        self.help_button.clicked.connect(self.open_help)
+        self.menuBar().setCornerWidget(self.help_button, Qt.TopRightCorner)
         menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.3.'))
         filebar = self._toolbar('Проект и правка')
         for key in ('new', 'open', 'save', 'undo', 'redo', 'copy', 'delete', 'transform'):
@@ -4774,6 +5812,12 @@ class StoneStudio(Studio):
         for label, widget in [('Ширина', self.sp_w), ('Высота', self.sp_h), ('Основание', self.sp_base), ('Высота из фото', self.sp_depth), ('Шаг рельефа', self.sp_step), ('Шаг привязки', self.sp_grid)]:
             form.addRow(label, widget)
             widget.show()
+        self.stl_min_wall = self._spin(0.5, 0.05, 200, 3, ' мм', 0.1)
+        self.stl_precision = self._spin(0.001, 1e-06, 1, 6, ' мм', 0.001)
+        self.stl_min_wall.setToolTip('Экспорт карты высот требует не меньшего расстояния до плоского дна. Для произвольной сетки такой проверки толщины пока нет.')
+        self.stl_precision.setToolTip('Максимальная допустимая ошибка координаты при записи STL в float32.')
+        form.addRow('STL: мин. основание', self.stl_min_wall)
+        form.addRow('STL: допуск координат', self.stl_precision)
         form.addRow(self.chk_invert)
         form.addRow('Сглаживание фото', self.sp_blur)
         self.chk_invert.show()
@@ -5234,7 +6278,10 @@ class StoneStudio(Studio):
                 b.setChecked(key == form.get('combine', 'add'))
 
     def _settings(self):
-        return dict(super()._settings(), workspace=self._parameters())
+        return dict(super()._settings(), workspace=self._parameters(), export_options=self._export_options())
+
+    def _export_options(self):
+        return dict(minimum_thickness=self.stl_min_wall.value(), precision=self.stl_precision.value())
 
     def _write(self, path):
         self._sculpt_release()
@@ -5249,7 +6296,7 @@ class StoneStudio(Studio):
 
     def state_sig(self):
         import hashlib
-        return hashlib.sha256((super().state_sig() + json.dumps(self._parameters(), sort_keys=True)).encode()).hexdigest()
+        return hashlib.sha256((super().state_sig() + json.dumps(dict(workspace=self._parameters(), export=self._export_options()), sort_keys=True)).encode()).hexdigest()
 
     def snapshot(self):
         result = super().snapshot()
@@ -5279,6 +6326,10 @@ class StoneStudio(Studio):
             return
         if super().open_project(path):
             self._restore_parameters(self._loaded_project_settings.get('workspace', {}))
+            self._irm_restore_state(self._loaded_project_settings.get('interactive', {}))
+            export = self._loaded_project_settings.get('export_options', {})
+            self.stl_min_wall.setValue(export.get('minimum_thickness', 0.5))
+            self.stl_precision.setValue(export.get('precision', 0.001))
             self.update_rulers()
             self._saved_sig = self.state_sig()
             self._remember_project(path)
@@ -5290,6 +6341,18 @@ class StoneStudio(Studio):
         if not self.has_content():
             self.sw_reset()
             self._v_key = None
+
+    def undo(self):
+        self._sculpt_release()
+        self._irm_release()
+        self._irm_cancel()
+        return super().undo()
+
+    def redo(self):
+        self._sculpt_release()
+        self._irm_release()
+        self._irm_cancel()
+        return super().redo()
 
     def preview_deform(self):
         self._preview_tool = 'deform'
@@ -5341,6 +6404,8 @@ class StoneStudio(Studio):
             self.plotter.iren.interactor.AddObserver(event, callback, 1.0)
 
     def toggle_sculpt(self, enabled):
+        if enabled and getattr(self, '_irm_enabled', False):
+            self.irm_enable_button.setChecked(False)
         if enabled and self.z is None:
             self.sculpt_action.setChecked(False)
             QMessageBox.information(self, 'Лепка', 'Создайте плоскую основу, рельеф из фото или откройте STL.')

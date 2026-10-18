@@ -1,0 +1,51 @@
+# Проверка доступности зависимостей Windows x64
+
+pip разрешил зависимости для CPython 3.12 / win_amd64 с --only-binary=:all: и --dry-run. Пакеты не устанавливались в Windows и не запускались. Это проверка доступности wheel, а не тест Windows 10/11.
+
+| Пакет | Версия | Wheel |
+| --- | --- | --- |
+| PySide6 | 6.12.0 | pyside6-6.12.0-cp310-abi3-win_amd64.whl |
+| numpy | 2.3.5 | numpy-2.3.5-cp312-cp312-win_amd64.whl |
+| pillow | 12.3.0 | pillow-12.3.0-cp312-cp312-win_amd64.whl |
+| scipy | 1.17.0 | scipy-1.17.0-cp312-cp312-win_amd64.whl |
+| trimesh | 5.1.1 | trimesh-5.1.1-py3-none-any.whl |
+| pyvista | 0.49.1 | pyvista-0.49.1-py3-none-any.whl |
+| pyvistaqt | 0.13.1 | pyvistaqt-0.13.1-py3-none-any.whl |
+| QtPy | 2.4.3 | QtPy-2.4.3-py3-none-any.whl |
+| ezdxf | 1.4.4 | ezdxf-1.4.4-cp312-cp312-win_amd64.whl |
+| rtree | 1.4.1 | rtree-1.4.1-py3-none-win_amd64.whl |
+| svgelements | 1.9.6 | svgelements-1.9.6-py2.py3-none-any.whl |
+| shapely | 2.2.0 | shapely-2.2.0-cp312-cp312-win_amd64.whl |
+| vtk | 9.5.2 | vtk-9.5.2-cp312-cp312-win_amd64.whl |
+| PySide6_Addons | 6.12.0 | pyside6_addons-6.12.0-cp310-abi3-win_amd64.whl |
+| PySide6_Essentials | 6.12.0 | pyside6_essentials-6.12.0-cp310-abi3-win_amd64.whl |
+| PySide6_Pdf | 6.12.0.140 | pyside6_pdf-6.12.0.140-cp310-abi3-win_amd64.whl |
+| PySide6_WebEngine | 6.12.0.140 | pyside6_webengine-6.12.0.140-cp310-abi3-win_amd64.whl |
+| pyvista-validation | 0.2.2 | pyvista_validation-0.2.2-cp310-abi3-win_amd64.whl |
+| shiboken6 | 6.12.0 | shiboken6-6.12.0-cp310-abi3-win_amd64.whl |
+| cyclopts | 5.2.0 | cyclopts-5.2.0-py3-none-any.whl |
+| matplotlib | 3.11.2 | matplotlib-3.11.2-cp312-cp312-win_amd64.whl |
+| fonttools | 4.67.0 | fonttools-4.67.0-cp312-cp312-win_amd64.whl |
+| packaging | 26.3 | packaging-26.3-py3-none-any.whl |
+| pyparsing | 3.3.3 | pyparsing-3.3.3-py3-none-any.whl |
+| scooby | 0.12.0 | scooby-0.12.0-py3-none-any.whl |
+| typing_extensions | 4.16.0 | typing_extensions-4.16.0-py3-none-any.whl |
+| pooch | 1.9.0 | pooch-1.9.0-py3-none-any.whl |
+| attrs | 26.1.0 | attrs-26.1.0-py3-none-any.whl |
+| contourpy | 1.4.0 | contourpy-1.4.0-cp312-cp312-win_amd64.whl |
+| cycler | 0.12.1 | cycler-0.12.1-py3-none-any.whl |
+| docstring_parser | 0.18.0 | docstring_parser-0.18.0-py3-none-any.whl |
+| kiwisolver | 1.5.1 | kiwisolver-1.5.1-cp312-cp312-win_amd64.whl |
+| platformdirs | 4.13.4 | platformdirs-4.13.4-py3-none-any.whl |
+| python-dateutil | 2.9.0.post0 | python_dateutil-2.9.0.post0-py2.py3-none-any.whl |
+| requests | 2.34.2 | requests-2.34.2-py3-none-any.whl |
+| rich | 15.0.0 | rich-15.0.0-py3-none-any.whl |
+| rich-rst | 2.2.0 | rich_rst-2.2.0-py3-none-any.whl |
+| certifi | 2026.10.18 | certifi-2026.10.18-py3-none-any.whl |
+| charset-normalizer | 3.5.2 | charset_normalizer-3.5.2-cp312-cp312-win_amd64.whl |
+| idna | 3.20 | idna-3.20-py3-none-any.whl |
+| markdown-it-py | 4.2.0 | markdown_it_py-4.2.0-py3-none-any.whl |
+| Pygments | 2.21.0 | pygments-2.21.0-py3-none-any.whl |
+| six | 1.17.0 | six-1.17.0-py2.py3-none-any.whl |
+| urllib3 | 2.8.0 | urllib3-2.8.0-py3-none-any.whl |
+| mdurl | 0.1.2 | mdurl-0.1.2-py3-none-any.whl |
