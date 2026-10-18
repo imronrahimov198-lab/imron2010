@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Stone Relief Studio — редактор векторов и рельефов, версия 3.0.
+"""Stone Relief Studio — редактор векторов и рельефов, версия 3.1.
 
-Все части программы объединены в этот файл. Другие файлы исходного кода не нужны.
+Вся программа находится в этом файле. Другие файлы исходного кода не нужны.
 Запуск: python stone_relief_studio_fixed.py
 Установка библиотек:
 python -m pip install PySide6 numpy Pillow scipy trimesh pyvista pyvistaqt qtpy ezdxf rtree svgelements shapely "vtk>=9.5,<9.6"
 
-Собственные значки и оформление, линейки в мм, F12, две направляющие,
-редактирование поверхности мышью в 3D, импорт SVG/DXF и экспорт STL.
-Независимые слои и управляющие линии пока не реализованы.
+Версия 3.1: проверка STL перед записью, безопасная порционная запись с отменой,
+правильные диапазоны знаковых/беззнаковых карт высот, бюджет памяти истории.
+Лимит буферов истории по умолчанию — 256 МБ; последний шаг сохраняется всегда.
+Независимые слои, управляющие линии и свободное редактирование сетки по X/Y
+пока не реализованы. Рельеф хранится как одна высота на точку XY.
 """
 
-# ================== Импорт SVG ==================
+# ==================== vector_import ====================
 
 import io
 from svgelements import SVG, Path, Shape, Move, Close, CubicBezier, QuadraticBezier
@@ -68,9 +70,10 @@ def parse_svg(text, node_type, path_type):
     width, height = (float(svg.width) * 25.4 / 96, float(svg.height) * 25.4 / 96)
     return (paths, (0.0, 0.0, width, height))
 
-# ================== Расчёт геометрии рельефа ==================
+# ==================== relief_geometry ====================
 
 import io
+import math
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from shapely.geometry import Polygon
@@ -78,14 +81,38 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 def photo_heights(raw, nx, ny, blur=0, invert=False):
     """Keep the source height precision; RGB previews never feed this calculation."""
-    image = ImageOps.exif_transpose(Image.open(io.BytesIO(raw)))
+    original = Image.open(io.BytesIO(raw))
+    tags = getattr(original, 'tag_v2', {})
+    bits, sample_format = (tags.get(258), tags.get(339))
+    if isinstance(bits, tuple):
+        bits = bits[0]
+    if isinstance(sample_format, tuple):
+        sample_format = sample_format[0]
+    if raw[:8] == b'\x89PNG\r\n\x1a\n' and len(raw) > 24:
+        bits, sample_format = (raw[24], 1)
+    image = ImageOps.exif_transpose(original)
     if image.mode in ('I;16', 'I;16L', 'I;16B', 'I', 'F'):
-        values = np.asarray(image, dtype=np.float32)
-        if image.mode == 'F':
+        array = np.asarray(image)
+        if not np.isfinite(array).all():
+            raise ValueError('Карта высот содержит NaN или бесконечность.')
+        if array.dtype.kind == 'f':
+            values = array.astype(np.float64)
             if values.min() < 0 or values.max() > 1:
-                values = (values - values.min()) / max(float(np.ptp(values)), 1e-12)
+                minimum, maximum = (float(values.min()), float(values.max()))
+                values -= minimum
+                values /= max(maximum - minimum, 1e-12)
         else:
-            values /= 65535.0
+            bits = int(bits or array.dtype.itemsize * 8)
+            if bits < 1 or bits > 64:
+                raise ValueError('Неподдерживаемая разрядность карты высот.')
+            signed = sample_format == 2 if sample_format is not None else array.dtype.kind == 'i'
+            if not signed and array.dtype.kind == 'i' and (bits == array.dtype.itemsize * 8):
+                array = array.view(np.dtype(array.dtype.str.replace('i', 'u')))
+            values = array.astype(np.float64)
+            minimum = -2 ** (bits - 1) if signed else 0
+            maximum = 2 ** (bits - 1) - 1 if signed else 2 ** bits - 1
+            values -= minimum
+            values /= maximum - minimum
     else:
         if 'A' in image.getbands() or 'transparency' in image.info:
             rgba = image.convert('RGBA')
@@ -94,6 +121,7 @@ def photo_heights(raw, nx, ny, blur=0, invert=False):
         values = np.asarray(image.convert('L'), dtype=np.float32) / 255.0
     if not np.isfinite(values).all():
         raise ValueError('Карта высот содержит недопустимые значения.')
+    values = np.asarray(values, dtype=np.float32)
     if blur > 0:
         values = gaussian_filter(values, blur)
     resized = Image.fromarray(values).resize((nx, ny), Image.Resampling.LANCZOS)
@@ -161,11 +189,22 @@ def coverage(polys, nx, ny, ss=None):
 
 def sculpt_weight(shape, center, cell, radius, mask=None, fixed=True):
     """Compact-support C2 displacement. Adds height without resampling fine detail."""
-    yy, xx = np.indices(shape, dtype=np.float32)
     x, y = center
     cx, cy = cell
-    r2 = ((xx - x) * cx) ** 2 + ((yy - y) * cy) ** 2
-    weight = np.maximum(1 - r2 / max(radius * radius, 1e-12), 0) ** 3
+    ny, nx = shape
+    x0, x1 = (max(0, int(math.floor(x - radius / cx))), min(nx, int(math.ceil(x + radius / cx)) + 1))
+    y0, y1 = (max(0, int(math.floor(y - radius / cy))), min(ny, int(math.ceil(y + radius / cy)) + 1))
+    weight = np.zeros(shape, dtype=np.float32)
+    if x0 >= x1 or y0 >= y1:
+        return weight
+    dx = (np.arange(x0, x1, dtype=np.float32) - x) * cx
+    dy = (np.arange(y0, y1, dtype=np.float32) - y) * cy
+    local = dy[:, None] ** 2 + dx[None, :] ** 2
+    local /= -max(radius * radius, 1e-12)
+    local += 1
+    np.maximum(local, 0, out=local)
+    np.power(local, 3, out=local)
+    weight[y0:y1, x0:x1] = local
     if mask is not None:
         weight *= mask
         if fixed:
@@ -174,7 +213,47 @@ def sculpt_weight(shape, center, cell, radius, mask=None, fixed=True):
             weight *= t * t * (3 - 2 * t)
     return weight
 
-# ================== Собственные значки ==================
+def history_storage_bytes(*stacks):
+    """Estimate retained model buffers; shared arrays and photos are counted once."""
+    seen = set()
+
+    def size(value):
+        if isinstance(value, np.ndarray):
+            while isinstance(value.base, np.ndarray):
+                value = value.base
+            if id(value) in seen:
+                return 0
+            seen.add(id(value))
+            return value.nbytes
+        if id(value) in seen:
+            return 0
+        seen.add(id(value))
+        if isinstance(value, dict):
+            return sum((size(item) for item in value.values()))
+        if isinstance(value, (list, tuple)):
+            return sum((size(item) for item in value))
+        if isinstance(value, bytes):
+            return len(value)
+        if isinstance(value, Image.Image):
+            return value.width * value.height * len(value.getbands()) * (4 if value.mode in ('I', 'F') else 1)
+        if hasattr(value, 'vertices') and hasattr(value, 'faces'):
+            return size(value.vertices) + size(value.faces)
+        return 0
+    return sum((size(stack) for stack in stacks))
+
+def trim_history_stacks(undo, redo, budget, max_steps=25):
+    """Keep nearby undo/redo states under a soft budget, retaining one last state."""
+    removed = 0
+    for stack in (undo, redo):
+        while len(stack) > max_steps:
+            stack.pop(0)
+            removed += 1
+    while len(undo) + len(redo) > 1 and history_storage_bytes(undo, redo) > budget:
+        (undo if len(undo) >= len(redo) else redo).pop(0)
+        removed += 1
+    return removed
+
+# ==================== studio_icons ====================
 
 from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
@@ -192,7 +271,191 @@ def icon(name, accent=False):
     painter.end()
     return QIcon(pixmap)
 
-# ================== Основа редактора ==================
+# ==================== stl_export ====================
+
+from dataclasses import dataclass
+from pathlib import Path as FilePath
+import math
+import os
+import shutil
+import sqlite3
+import struct
+import tempfile
+import numpy as np
+
+class ExportCancelled(Exception):
+    """The user cancelled before the destination was replaced."""
+
+@dataclass(frozen=True)
+class ExportReport:
+    triangles: int
+    dimensions: tuple
+    volume: float
+_STL_RECORD = np.dtype([('normal', '<f4', 3), ('vertices', '<f4', (3, 3)), ('attribute', '<u2')])
+
+def _export_progress(callback, phase, current, total):
+    if callback:
+        callback(phase, current, total)
+
+def validate_stl_mesh(vertices, faces, progress=None, chunk_size=8192):
+    """Check indexed geometry; store edge counts on disk instead of large RAM arrays.
+
+    Detects invalid coordinates/indices, degenerate triangles, open/nonmanifold
+    edges, inconsistent winding and nonpositive signed volume. It does not detect
+    arbitrary triangle self-intersections.
+    """
+    vertices, faces = (np.asarray(vertices), np.asarray(faces))
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or (not len(vertices)):
+        raise ValueError('В модели нет вершин XYZ.')
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) < 4:
+        raise ValueError('Для замкнутой STL-модели нужны треугольные грани.')
+    if not np.issubdtype(faces.dtype, np.integer):
+        raise ValueError('Индексы треугольников должны быть целыми числами.')
+    if len(faces) > 4294967295:
+        raise ValueError('Число треугольников превышает предел двоичного STL.')
+    low, high = (np.full(3, np.inf), np.full(3, -np.inf))
+    for start in range(0, len(vertices), chunk_size):
+        block = vertices[start:start + chunk_size]
+        if not np.isfinite(block).all() or np.max(np.abs(block)) > np.finfo(np.float32).max:
+            raise ValueError('Координаты содержат NaN, бесконечность или выходят за диапазон STL.')
+        low, high = (np.minimum(low, block.min(axis=0)), np.maximum(high, block.max(axis=0)))
+    if np.any(high <= low):
+        raise ValueError('Модель должна иметь положительные размеры по X, Y и Z.')
+    reference = low / 2 + high / 2
+    volume_parts = []
+    with tempfile.TemporaryDirectory(prefix='stone_stl_check_') as folder:
+        database = sqlite3.connect(str(FilePath(folder) / 'edges.sqlite'))
+        try:
+            database.execute('PRAGMA journal_mode=OFF')
+            database.execute('PRAGMA synchronous=OFF')
+            database.execute('PRAGMA cache_size=-8192')
+            database.execute('PRAGMA temp_store=FILE')
+            database.execute('CREATE TABLE edges(a INTEGER, b INTEGER, n INTEGER, d INTEGER, PRIMARY KEY(a,b)) WITHOUT ROWID')
+            for start in range(0, len(faces), chunk_size):
+                block = faces[start:start + chunk_size]
+                if block.min() < 0 or block.max() >= len(vertices):
+                    raise ValueError('Треугольник ссылается на несуществующую вершину.')
+                triangle = np.asarray(vertices[block], dtype=np.float32).astype(np.float64)
+                normal = np.cross(triangle[:, 1] - triangle[:, 0], triangle[:, 2] - triangle[:, 0])
+                if np.any(np.linalg.norm(normal, axis=1) == 0):
+                    raise ValueError('Обнаружены вырожденные треугольники. Исправьте сетку перед экспортом.')
+                local = triangle - reference
+                volume_parts.append(float(np.einsum('ij,ij->i', local[:, 0], np.cross(local[:, 1], local[:, 2])).sum() / 6))
+                edges = np.concatenate((block[:, (0, 1)], block[:, (1, 2)], block[:, (2, 0)]))
+                database.executemany('INSERT INTO edges VALUES(?,?,1,?) ON CONFLICT(a,b) DO UPDATE SET n=n+1,d=d+excluded.d', ((int(min(a, b)), int(max(a, b)), 1 if a < b else -1) for a, b in edges))
+                _export_progress(progress, 'check', min(start + chunk_size, len(faces)), len(faces))
+            bad_edges = database.execute('SELECT COUNT(*) FROM edges WHERE n!=2').fetchone()[0]
+            if bad_edges:
+                raise ValueError(f'Сетка незамкнута или содержит неманифолдные рёбра: {bad_edges}. Экспорт отменён. Исправьте сетку.')
+            bad_directions = database.execute('SELECT COUNT(*) FROM edges WHERE d!=0').fetchone()[0]
+            if bad_directions:
+                raise ValueError(f'Нарушена ориентация граней у {bad_directions} рёбер. Исправьте нормали перед экспортом.')
+        finally:
+            database.close()
+    volume = math.fsum(volume_parts)
+    if not math.isfinite(volume) or volume <= 0:
+        raise ValueError('Объём модели нулевой или нормали направлены внутрь. Исправьте сетку перед экспортом.')
+    return ExportReport(len(faces), tuple((float(x) for x in high - low)), volume)
+
+def _stl_records(triangles):
+    triangles = np.asarray(triangles, dtype=np.float32)
+    wide = triangles.astype(np.float64)
+    normals = np.cross(wide[:, 1] - wide[:, 0], wide[:, 2] - wide[:, 0])
+    lengths = np.linalg.norm(normals, axis=1)
+    if not np.isfinite(normals).all() or np.any(lengths == 0):
+        raise ValueError('Невозможно записать вырожденный треугольник.')
+    normals /= lengths[:, None]
+    records = np.zeros(len(triangles), dtype=_STL_RECORD)
+    records['normal'], records['vertices'] = (normals, triangles)
+    return records
+
+def _atomic_stl(path, report, batches, progress=None):
+    path = FilePath(path)
+    expected_size = 84 + 50 * report.triangles
+    if shutil.disk_usage(path.parent).free < expected_size + 4 * 1024 ** 2:
+        raise OSError('Недостаточно свободного места для безопасной записи STL. Старый файл сохранён.')
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.' + path.name + '.', suffix='.tmp', dir=path.parent, delete=False) as stream:
+            temporary = FilePath(stream.name)
+            stream.write(b'Stone Relief Studio 3.1; millimetres'.ljust(80, b' '))
+            stream.write(struct.pack('<I', report.triangles))
+            written = 0
+            for triangles in batches:
+                stream.write(_stl_records(triangles).tobytes())
+                written += len(triangles)
+                _export_progress(progress, 'write', written, report.triangles)
+            if written != report.triangles or stream.tell() != expected_size:
+                raise ValueError('Число записанных треугольников не совпало с расчётом. Старый файл сохранён.')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return report
+
+def export_indexed_stl(path, vertices, faces, progress=None, chunk_size=8192):
+    vertices, faces = (np.asarray(vertices), np.asarray(faces))
+    report = validate_stl_mesh(vertices, faces, progress, chunk_size)
+    batches = (vertices[faces[start:start + chunk_size]] for start in range(0, len(faces), chunk_size))
+    return _atomic_stl(path, report, batches, progress)
+
+def _heightfield_batches(z, xs, ys, chunk_size=8192):
+    ny, nx = z.shape
+    for row in range(ny - 1):
+        for start in range(0, nx - 1, chunk_size):
+            end = min(start + chunk_size, nx - 1)
+            count = end - start
+            a = np.column_stack((xs[start:end], np.full(count, ys[row]), z[row, start:end]))
+            b = np.column_stack((xs[start + 1:end + 1], np.full(count, ys[row]), z[row, start + 1:end + 1]))
+            c = np.column_stack((xs[start:end], np.full(count, ys[row + 1]), z[row + 1, start:end]))
+            d = np.column_stack((xs[start + 1:end + 1], np.full(count, ys[row + 1]), z[row + 1, start + 1:end + 1]))
+            yield np.concatenate((np.stack((a, b, d), axis=1), np.stack((a, d, c), axis=1)))
+    ix = np.concatenate((np.arange(nx - 1), np.full(ny - 1, nx - 1), np.arange(nx - 1, 0, -1), np.zeros(ny - 1, int)))
+    iy = np.concatenate((np.zeros(nx - 1, int), np.arange(ny - 1), np.full(nx - 1, ny - 1), np.arange(ny - 1, 0, -1)))
+    perimeter = np.column_stack((xs[ix], ys[iy], z[iy, ix]))
+    for start in range(0, len(perimeter), chunk_size):
+        indices = np.arange(start, min(start + chunk_size, len(perimeter)))
+        a, b = (perimeter[indices], perimeter[(indices + 1) % len(perimeter)])
+        bottom_a, bottom_b = (a.copy(), b.copy())
+        bottom_a[:, 2] = bottom_b[:, 2] = 0
+        centre = np.zeros_like(a)
+        yield np.concatenate((np.stack((a, bottom_a, bottom_b), axis=1), np.stack((a, bottom_b, b), axis=1), np.stack((centre, bottom_b, bottom_a), axis=1)))
+
+def export_heightmap_stl(path, z, width, height, progress=None):
+    z = np.asarray(z)
+    if z.ndim != 2 or min(z.shape) < 2:
+        raise ValueError('Рельеф должен содержать минимум 2×2 точки.')
+    if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or (height <= 0):
+        raise ValueError('Ширина и высота модели должны быть положительными числами в миллиметрах.')
+    ny, nx = z.shape
+    count = 2 * (nx - 1) * (ny - 1) + 3 * (2 * nx + 2 * ny - 4)
+    if count > 4294967295:
+        raise ValueError('Слишком много треугольников для двоичного STL.')
+    maximum = 0.0
+    for start in range(0, ny, 64):
+        block = z[start:start + 64]
+        if not np.isfinite(block).all() or np.max(np.abs(block)) > np.finfo(np.float32).max:
+            raise ValueError('Карта высот содержит NaN, бесконечность или слишком большие значения.')
+        if np.any(block <= 0) or np.any(np.asarray(block, dtype=np.float32) <= 0):
+            raise ValueError('Поверхность касается или пересекает дно Z=0. Увеличьте толщину основания перед экспортом.')
+        maximum = max(maximum, float(block.max()))
+        _export_progress(progress, 'check', min(start + 64, ny), ny)
+    xs = np.linspace(-width / 2, width / 2, nx, dtype=np.float32)
+    ys = np.linspace(-height / 2, height / 2, ny, dtype=np.float32)
+    if np.any(np.diff(xs) <= 0) or np.any(np.diff(ys) <= 0) or (not np.isfinite(xs).all()) or (not np.isfinite(ys).all()):
+        raise ValueError('Шаг координат нельзя представить в STL без вырождения треугольников.')
+    integral = 0.0
+    for start in range(0, ny - 1, 64):
+        end = min(start + 64, ny - 1)
+        integral += 2 * np.sum(z[start:end, :-1], dtype=np.float64) + np.sum(z[start:end, 1:], dtype=np.float64) + np.sum(z[start + 1:end + 1, :-1], dtype=np.float64) + 2 * np.sum(z[start + 1:end + 1, 1:], dtype=np.float64)
+    volume = integral * (width / (nx - 1)) * (height / (ny - 1)) / 6
+    report = ExportReport(count, (float(width), float(height), maximum), float(volume))
+    return _atomic_stl(path, report, _heightfield_batches(z, xs, ys), progress)
+
+# ==================== studio_core ====================
 
 import hashlib
 import uuid
@@ -485,13 +748,28 @@ def grid_shape(W, H, res):
 
 def grid_from_step(W, H, step, max_cells=8000000):
     """Размер сетки (nx, ny) для шага в мм; при слишком большой сетке шаг увеличивается."""
+    if not all((math.isfinite(float(v)) for v in (W, H, step))) or W <= 0 or H <= 0:
+        raise ValueError('Размеры и шаг сетки должны быть конечными положительными числами.')
+    if max_cells < 4:
+        raise ValueError('Для сетки нужны минимум четыре точки.')
     step = max(float(step), 0.001)
-    nx, ny = (int(round(W / step)) + 1, int(round(H / step)) + 1)
-    used = step
-    if nx * ny > max_cells:
-        used = math.sqrt(W * H / max_cells)
-        nx, ny = (int(round(W / used)) + 1, int(round(H / used)) + 1)
-    return (max(nx, 2), max(ny, 2), used)
+
+    def dimensions(value):
+        return (max(2, int(round(W / value)) + 1), max(2, int(round(H / value)) + 1))
+    nx, ny = dimensions(step)
+    if nx * ny <= max_cells:
+        return (nx, ny, step)
+    low, high = (step, max(step, math.sqrt(W) * math.sqrt(H) / math.sqrt(max_cells), W / (max_cells // 2 - 1), H / (max_cells // 2 - 1)))
+    while math.prod(dimensions(high)) > max_cells:
+        high *= 2
+    for _ in range(48):
+        middle = (low + high) / 2
+        if math.prod(dimensions(middle)) > max_cells:
+            low = middle
+        else:
+            high = middle
+    nx, ny = dimensions(high)
+    return (nx, ny, high)
 
 def grid_shape_xy(W, H, res):
     ny, nx = grid_shape(W, H, res) if W >= H else (None, None)
@@ -881,7 +1159,7 @@ def deform_offsets(mask, cell_x, cell_y, p, guides=None, ctrl=None, rails=None, 
     ys_, xs_ = np.where(mask)
     if len(xs_) == 0:
         raise ValueError('Область пуста')
-    yy, xx = np.indices((ny, nx), dtype=np.float64)
+    yy, xx = np.ogrid[:ny, :nx]
     S = lambda t: section_eval(p['section'], t)
     mode = p['mode']
     off = np.zeros((ny, nx))
@@ -1135,7 +1413,7 @@ def unpack_project(path):
     return (meta, photo, arrays)
 from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QPolygonF, QShortcut
-from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsItem, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QInputDialog, QRadioButton, QButtonGroup, QTabWidget, QTextBrowser, QToolBar, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsItem, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QInputDialog, QRadioButton, QButtonGroup, QProgressDialog, QTabWidget, QTextBrowser, QToolBar, QToolButton, QVBoxLayout, QWidget
 APP = 'Stone Relief Studio Pro'
 
 def glyph_icon(ch, size=30, color='#eeeeee'):
@@ -2298,21 +2576,27 @@ class Studio(QMainWindow):
         h = hashlib.md5(self.state_sig_light().encode())
         h.update(self.photo_bytes or b'')
         if self.z is not None:
-            h.update(np.ascontiguousarray(self.z).tobytes())
+            h.update(memoryview(np.ascontiguousarray(self.z)).cast('B'))
         h.update(str((self.sp_w.value(), self.sp_h.value(), self.sp_base.value(), self.sp_depth.value(), self.sl_photo.value())).encode())
         return h.hexdigest()
 
     def push_history(self, label, snap=None):
         self.undo_stack.append((label, snap if snap is not None else self.snapshot()))
-        if len(self.undo_stack) > 25:
-            self.undo_stack.pop(0)
         self.redo_stack = []
+        self._trim_history()
         self.refresh_history()
+
+    def _trim_history(self):
+        return trim_history_stacks(self.undo_stack, self.redo_stack, getattr(self, 'history_max_bytes', 256 * 1024 ** 2))
 
     def refresh_history(self):
         self.hist.clear()
         for i, (label, _) in enumerate(reversed(self.undo_stack), 1):
             self.hist.addItem(f'{i}. {label}')
+        if hasattr(self, 'lb_history_memory'):
+            used = history_storage_bytes(self.undo_stack, self.redo_stack) / 1024 ** 2
+            limit = getattr(self, 'history_max_bytes', 256 * 1024 ** 2) / 1024 ** 2
+            self.lb_history_memory.setText(f'Буферы истории: {used:.1f} / {limit:g} МБ\nПоследний шаг сохраняется даже при превышении лимита.')
 
     def restore(self, s):
         self.cancel_preview(silent=True)
@@ -2337,6 +2621,7 @@ class Studio(QMainWindow):
         label, s = self.undo_stack.pop()
         self.redo_stack.append((label, self.snapshot()))
         self.restore(s)
+        self._trim_history()
         self.refresh_history()
         self.statusBar().showMessage('Отменено: ' + label)
 
@@ -2346,6 +2631,7 @@ class Studio(QMainWindow):
         label, s = self.redo_stack.pop()
         self.undo_stack.append((label, self.snapshot()))
         self.restore(s)
+        self._trim_history()
         self.refresh_history()
         self.statusBar().showMessage('Повторено: ' + label)
 
@@ -2404,7 +2690,11 @@ class Studio(QMainWindow):
         self._check_free_preview()
         W, H = (self.sp_w.value(), self.sp_h.value())
         nx, ny = self.grid_dims(W, H)
-        h = photo_heights(self.photo_bytes, nx, ny, self.sp_blur.value(), self.chk_invert.isChecked())
+        try:
+            h = photo_heights(self.photo_bytes, nx, ny, self.sp_blur.value(), self.chk_invert.isChecked())
+        except ValueError as ex:
+            QMessageBox.warning(self, 'Карта высот', str(ex))
+            return
         self.push_history('Рельеф из фото')
         self.stl_mesh = None
         self.z = self.sp_base.value() + self.sp_depth.value() * h
@@ -3705,6 +3995,8 @@ class Studio(QMainWindow):
             mesh = trimesh.load(path, force='mesh')
             if mesh.is_empty or not hasattr(mesh, 'faces'):
                 raise ValueError('В файле нет треугольной сетки.')
+            if not np.isfinite(mesh.vertices).all() or np.any(mesh.extents <= 0):
+                raise ValueError('STL содержит недопустимые координаты или нулевой размер модели.')
         except Exception as ex:
             QMessageBox.critical(self, 'Ошибка STL', str(ex))
             return
@@ -3717,7 +4009,9 @@ class Studio(QMainWindow):
         self.z = None
         for w, v in ((self.sp_w, ext[0]), (self.sp_h, ext[1])):
             w.blockSignals(True)
-            w.setValue(float(np.clip(v, 10, 3000)))
+            w.setDecimals(6)
+            w.setRange(min(w.minimum(), float(v)), max(w.maximum(), float(v)))
+            w.setValue(float(v))
             w.blockSignals(False)
         edit_note = ''
         try:
@@ -3751,26 +4045,45 @@ class Studio(QMainWindow):
             return
         if not path.lower().endswith('.stl'):
             path += '.stl'
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        dialog = QProgressDialog('Проверка модели…', 'Отмена', 0, 100, self)
+        dialog.setWindowTitle('Экспорт STL · миллиметры')
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.show()
+        last_update = [0.0]
+
+        def progress(phase, current, total):
+            if dialog.wasCanceled():
+                raise ExportCancelled()
+            now = time.monotonic()
+            if now - last_update[0] < 0.05 and current != total:
+                return
+            last_update[0] = now
+            dialog.setLabelText('Проверка геометрии и замкнутости…' if phase == 'check' else 'Запись STL порциями…')
+            value = round(40 * current / max(total, 1)) if phase == 'check' else 40 + round(59 * current / max(total, 1))
+            dialog.setValue(value)
+            QApplication.processEvents()
+            if dialog.wasCanceled():
+                raise ExportCancelled()
         try:
             if self.z is not None:
-                verts, faces = build_mesh_arrays(self.z, self.sp_w.value(), self.sp_h.value())
+                report = export_heightmap_stl(path, self.z, self.sp_w.value(), self.sp_h.value(), progress)
             else:
-                verts, faces = (np.asarray(self.stl_mesh.vertices), np.asarray(self.stl_mesh.faces))
-            import trimesh
-            check = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-            if not np.isfinite(verts).all():
-                raise ValueError('Модель содержит недопустимые координаты.')
-            tight = check.is_watertight
-            winding = check.is_winding_consistent
-            degenerate = int(np.count_nonzero(check.area_faces < 1e-12))
-            write_stl(path, verts, faces)
-        except Exception as ex:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, 'Ошибка экспорта', str(ex))
+                report = export_indexed_stl(path, self.stl_mesh.vertices, self.stl_mesh.faces, progress)
+        except ExportCancelled:
+            self.statusBar().showMessage('Экспорт отменён. Существующий STL не изменён.')
             return
-        QApplication.restoreOverrideCursor()
-        QMessageBox.information(self, 'Готово', f"STL сохранён (мм):\n{path}\nЗамкнутая модель: {('да' if tight else 'нет')}\nОриентация граней согласована: {('да' if winding else 'нет')}\nВырожденных треугольников: {degenerate}")
+        except Exception as ex:
+            dialog.close()
+            QMessageBox.warning(self, 'STL не сохранён', str(ex))
+            return
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+        sizes = ' × '.join((f'{value:.6g}' for value in report.dimensions))
+        QMessageBox.information(self, 'STL сохранён', f'{path}\nРазмеры: {sizes} мм\nТреугольников: {report.triangles:,}\nПроверка замкнутости и ориентации пройдена.\nВырожденных треугольников нет.')
 
     def _settings(self):
         return dict(w=self.sp_w.value(), h=self.sp_h.value(), base=self.sp_base.value(), depth=self.sp_depth.value(), step=self.sp_step.value(), grid=self.sp_grid.value(), blur=self.sp_blur.value(), invert=self.chk_invert.isChecked(), photo_fade=self.sl_photo.value(), material=self.cb_mat.currentIndex(), bright=self.l_bright.value(), contrast=self.l_contrast.value(), az=self.l_az.value(), el=self.l_el.value(), sun=self.chk_sun.isChecked(), fill=self.chk_fill.isChecked(), level=self.c_level.value())
@@ -4046,7 +4359,7 @@ def build_book_images(folder):
     return out
 BOOK = [('draw', 'Рисование вектора', 'Обвести лепесток, лист или орнамент тонкой чёрной линией (прямые и кривые Безье).', ['Кнопка «✎» слева.', 'ЛКМ — поставить точку. Две точки — прямая.', 'Нажать и потянуть — получится гладкий узел с кривой.', 'ПКМ — закончить открытый вектор (он сохранится). Щелчок по первой точке — замкнуть.', 'После завершения программа переходит в режим выделения; Esc отменяет незаконченное.'], ['ЛКМ — точка (тянуть — кривая)', 'ПКМ — закончить открытый', 'Esc — отмена', 'Колесо — масштаб, средняя кнопка — перемещение холста'], 'Обведите лепесток замкнутым вектором — он станет областью деформации.'), ('nodes', 'Узлы и ручки Безье', 'Точная правка формы вектора.', ['Выделите вектор щелчком по линии (Shift или рамка — несколько).', 'Тяните квадратики-узлы и синие ручки.', 'Двойной щелчок по узлу — гладкий/острый.', 'ПКМ по линии — «Добавить узел здесь», по узлу — «Удалить узел».'], ['ЛКМ — тянуть узел/ручку', 'Alt при тяге ручки — независимо от второй', 'ПКМ — меню', 'Delete — удалить'], 'Подгоните контур по краю лепестка, добавляя узлы в изгибах.'), ('segment', 'Удалить участок', 'Убрать часть линии между двумя соседними точками; остальное остаётся независимыми векторами.', ['ПКМ прямо на нужном сегменте.', 'Выберите «Удалить участок».'], ['ПКМ по сегменту — контекстное меню'], 'Замкнутый контур станет открытой линией, открытый — разделится на две части.'), ('fade', 'Осветление фото до белого фона', 'Плавно превратить подложку в белую, не трогая векторы и рельеф.', ['Ползунок над 2D-окном.', '0 — фото, 100 — белый фон.'], ['Только ползунок'], 'Осветлите на 65% и рисуйте мелкие детали, чёрные линии останутся видны.'), ('deform', 'Деформация поверхности', 'Управлять формой всей области: плавный изгиб, волна, вершина, между направляющими, по управляющим точкам.', ['Выделите замкнутый вектор — это область.', 'Выберите вид; задайте высоты сторон/точек; нарисуйте сечение (форму перехода).', '«Закрепить границы» оставляет край; поле «Слияние» — как форма объединяется с рельефом.', 'Для «Между направляющими» выделите два открытых вектора; для точек — поставьте «◉».', 'Перейдите в «Редактирование 3D», нажмите «Предпросмотр», затем «Применить» или «Отмена».'], ['Ctrl+Z / Ctrl+Y — отмена и повтор', 'Остальная поверхность затемняется в предпросмотре'], 'Рисунки справа получены тем же алгоритмом, что и в программе, на учебном лепестке.'), ('editor', 'Редактор формы (F12)', 'Создать форму внутри выделенных замкнутых векторов (округлая, угловая, плато) и объединить её с рельефом; обнулить рельеф внутри или снаружи векторов.', ['Выделите замкнутые векторы и нажмите F12 (Рельефы → Редактор формы).', 'Выберите форму: округлая, угловая или плато; задайте угол (отрицательный — выемка) и начальную высоту.', 'Высота: без ограничений, ограничить по высоте, масштаб по высоте или постоянная высота.', 'Выберите действие: Добавить, Вычитание, По наибольш., По наименьш., Обнул. внутри, Обнул. снаружи.', '«Предпросмотр» показывает результат, «Применить» меняет рельеф, «Сброс» возвращает настройки.'], ['F12 — открыть окно', 'Ctrl+Z — отмена'], 'Округлый лепесток: угол 45°, «Масштаб по высоте» 0,8 мм, действие «Добавить».'), ('sweep', 'Вытягивание по двум направляющим', 'Создать рельеф вытягиванием одного или нескольких сечений вдоль двух направляющих; результат объединяется с рельефом.', ['Нарисуйте открытые векторы: верхнюю и нижнюю направляющие и одно или несколько сечений.', 'Выделите все векторы и нажмите «Верхняя направляющая — Выбор»: первый — верхняя, второй — нижняя, остальные — сечения.', 'Или выбирайте по одному: «Нижняя направляющая», «Граница по Z» (кнопки «Выбор»), «Добавить сечение».', '«Развернуть направляющие» меняет направление, «Переход между сечениями» плавно смешивает сечения.', '«Масштабировать высоту по ширине», «Начальная высота» и «Масштабировать конечную высоту» задают высоту.', 'Выберите «Объединить» (добавить, вычесть, по наибольшему, по наименьшему) и нажмите «Вычислить».'], ['Рельефы → Вытягиваемые профили', 'Сечение идёт от первой точки вектора к последней, вверх — выше'], 'Одно сечение-арка даёт валик вдоль траектории; два сечения с переходом — валик, плавно меняющий форму.'), ('transform', 'Перемещение готового рельефа', 'Сдвинуть, повернуть, масштабировать, копировать, отразить выбранную часть рельефа.', ['Выделите замкнутый вектор.', 'Задайте сдвиг в мм, угол, масштаб.', '«Переместить» или «Копировать в новое место»; «Отразить» — по горизонтали или вертикали.', 'Флажок «вместе со связанными векторами» переносит и контуры.'], ['Ctrl+Z — отмена'], 'Скопируйте лепесток на другое место модели.'), ('contour', 'Векторы по высоте', 'Создать контур по границе заданного уровня рельефа.', ['Вкладка «Контуры по высоте».', 'Задайте уровень в мм (например 7 при высоте 10).', '«Построить контуры» — появятся обычные редактируемые векторы.'], ['—'], 'Уровень 7 мм при высоте 10 мм даёт линию по верхней части.'), ('light', 'Освещение и материалы', 'Менять вид модели светом; STL при этом не меняется.', ['Вкладка «Свет 3D»: материал, яркость, контраст.', 'Солнце: поворот и высота, значок, выключение.', 'Дополнительный свет можно отключить; «Тени» включает тени (медленнее).'], ['ЛКМ — вращать', 'Колесо — масштаб', 'Shift+ЛКМ — сдвиг'], 'Проверяйте рельеф при низком боковом свете — так его увидят на камне.'), ('files', 'Файлы, история и экспорт', 'Сохранение проекта, импорт DXF/SVG, экспорт SVG и STL в мм.', ['Ctrl+S — сохранить проект (фото, векторы, размеры, настройки, геометрия).', 'Ctrl+O — открыть.', 'Файл → Импорт DXF / SVG; Экспорт SVG, Экспорт STL.', 'Толщину основания можно менять в любой момент.'], ['Ctrl+Z / Ctrl+Y', 'F1 — эта книга'], 'Перед экспортом STL смотрите «Замкнутая модель: да».')]
 
-# ================== Рабочее пространство и запуск ==================
+# ==================== stone_relief_studio ====================
 
 import json
 import math
@@ -4114,6 +4427,10 @@ class StoneStudio(Studio):
         self._stroke = None
         self._preview_tool = None
         self.settings = QSettings('StoneReliefStudio', 'Workspace')
+        try:
+            self.history_max_bytes = max(64, min(4096, int(self.settings.value('historyBudgetMiB', 256)))) * 1024 ** 2
+        except (ValueError, TypeError):
+            self.history_max_bytes = 256 * 1024 ** 2
         super().__init__()
         self.setStyleSheet(STYLE)
         self.setWindowIcon(icon('dome', True))
@@ -4191,7 +4508,7 @@ class StoneStudio(Studio):
             menus['Рельефы'].addAction(title, lambda op=op: self.relief_op(op))
         menus['Рельефы'].addAction(actions['stl'])
         menus['Справка'].addAction(self._action('Справочник инструментов', 'new', self.open_help, 'F1'))
-        menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.0.'))
+        menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.1.'))
         filebar = self._toolbar('Проект и правка')
         for key in ('new', 'open', 'save', 'undo', 'redo', 'copy', 'delete', 'transform'):
             filebar.addAction(actions[key])
@@ -4294,6 +4611,21 @@ class StoneStudio(Studio):
             combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         menus['Вид'].addAction(dock.toggleViewAction())
         menus['Модель'].addAction('Размеры и параметры', lambda: self.show_inspector(0))
+        history_layout = self.hist.parentWidget().layout()
+        budget_row = QWidget()
+        budget_form = QFormLayout(budget_row)
+        self.history_budget = QSpinBox()
+        self.history_budget.setRange(64, 4096)
+        self.history_budget.setSingleStep(64)
+        self.history_budget.setSuffix(' МБ')
+        self.history_budget.setValue(self.history_max_bytes // 1024 ** 2)
+        self.history_budget.valueChanged.connect(self.set_history_budget)
+        budget_form.addRow('Лимит буферов истории', self.history_budget)
+        self.lb_history_memory = QLabel()
+        self.lb_history_memory.setWordWrap(True)
+        history_layout.insertWidget(0, budget_row)
+        history_layout.insertWidget(1, self.lb_history_memory)
+        self.refresh_history()
         self.view.setBackgroundBrush(QColor('#75858b'))
         parent_layout = self.tabs.widget(0).layout()
         parent_layout.removeWidget(self.view)
@@ -4340,6 +4672,12 @@ class StoneStudio(Studio):
         self.inspector.show()
         self.inspector.raise_()
         self.inspector_tabs.setCurrentIndex(index)
+
+    def set_history_budget(self, mib):
+        self.history_max_bytes = int(mib) * 1024 ** 2
+        self.settings.setValue('historyBudgetMiB', int(mib))
+        self._trim_history()
+        self.refresh_history()
 
     def update_rulers(self, *_):
         self.ruler_x.update()
