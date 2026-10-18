@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Stone Relief Studio — редактор векторов и рельефов, версия 3.2.
+"""Stone Relief Studio — редактор векторов и рельефов, версия 3.3.
 
 Вся программа находится в этом файле. Другие файлы исходного кода не нужны.
 Запуск: python stone_relief_studio_fixed.py
 Установка библиотек:
 python -m pip install PySide6 numpy Pillow scipy trimesh pyvista pyvistaqt qtpy ezdxf rtree svgelements shapely "vtk>=9.5,<9.6"
 
-Версия 3.2: завершение лепки до сохранения и закрытия, сохранение исходной
-STL-сетки в проекте, проверка проекта до открытия, ускоренная проверка STL.
+Версия 3.3: Home возвращает модель в кадр в 2D и 3D; Ctrl+Home приближает
+выделенные векторы. В панели модели показаны их размеры и положение в мм.
+Меню «Файл → Недавние проекты» хранит последние шесть проектов.
+Радиус и сила кисти, защита основания, шаг узлов и привязки запоминаются.
+Сохранены исправления версии 3.2: проверка проектов, сохранение исходной
+STL-сетки и жеста лепки перед закрытием, ускоренная проверка STL.
 Ноль рельефа соответствует верху основания; его толщину можно защитить при лепке.
 Проекты формата 4 читаются этой версией; поддерживается открытие форматов 2 и 3.
 STL не хранит обязательных единиц: при открытии выберите миллиметры.
@@ -401,7 +405,7 @@ def _atomic_stl(path, report, batches, progress=None):
     try:
         with tempfile.NamedTemporaryFile(prefix='.' + path.name + '.', suffix='.tmp', dir=path.parent, delete=False) as stream:
             temporary = FilePath(stream.name)
-            stream.write(b'Stone Relief Studio 3.2; millimetres'.ljust(80, b' '))
+            stream.write(b'Stone Relief Studio 3.3; millimetres'.ljust(80, b' '))
             stream.write(struct.pack('<I', report.triangles))
             written = 0
             for triangles in batches:
@@ -4595,6 +4599,13 @@ class StoneStudio(Studio):
         self._stroke = None
         self._preview_tool = None
         self.settings = QSettings('StoneReliefStudio', 'Workspace')
+        self._recent_projects = []
+        try:
+            recent = json.loads(str(self.settings.value('recentProjects', '[]')))
+            if isinstance(recent, list):
+                self._recent_projects = list(dict.fromkeys((p for p in recent if isinstance(p, str) and p)))[:6]
+        except (ValueError, TypeError):
+            pass
         try:
             self.history_max_bytes = max(64, min(4096, int(self.settings.value('historyBudgetMiB', 256)))) * 1024 ** 2
         except (ValueError, TypeError):
@@ -4619,6 +4630,7 @@ class StoneStudio(Studio):
         self.view.viewport().installEventFilter(self)
         self.view.viewport().setMouseTracking(True)
         self._install_sculpt()
+        self._restore_user_preferences()
         self._saved_sig = self.state_sig()
         self.statusBar().showMessage('Векторы — слева. Формы и рельеф — сверху. F12 — редактор формы.')
 
@@ -4650,13 +4662,17 @@ class StoneStudio(Studio):
         self.setStyleSheet(STYLE)
         self._shell_actions = {}
         actions = self._shell_actions
-        for key, label, glyph, slot, shortcut in [('new', 'Новый проект', 'new', self.new_project, 'Ctrl+N'), ('open', 'Открыть проект…', 'open', self.open_project, 'Ctrl+O'), ('save', 'Сохранить', 'save', self.save_project, 'Ctrl+S'), ('saveas', 'Сохранить как…', 'save', self.save_project_as, 'Ctrl+Shift+S'), ('undo', 'Отменить', 'undo', self.undo, 'Ctrl+Z'), ('redo', 'Повторить', 'redo', self.redo, 'Ctrl+Y'), ('copy', 'Создать копию', 'copy', self.copy_selected, 'Ctrl+D'), ('delete', 'Удалить выделенное', 'delete', self.delete_selected, None), ('transform', 'Размер, поворот и положение…', 'transform', self.transform_dialog, None), ('photo', 'Открыть фотографию…', 'photo', self.open_photo, 'Ctrl+I'), ('svg', 'Импорт SVG 1:1…', 'open', self.import_svg, None), ('dxf', 'Импорт DXF 1:1…', 'open', self.import_dxf, None), ('svgout', 'Экспорт SVG…', 'save', self.export_svg, None), ('stlin', 'Открыть STL…', 'stl', self.open_stl, None), ('stl', 'Экспорт STL…', 'stl', self.export_stl, 'Ctrl+E'), ('shape', 'Форма · F12', 'shape', self.open_relief_editor, 'F12'), ('sweep', 'Две направляющие', 'rails', self.open_sweep_dialog, None), ('dome', 'Купол', 'dome', self.create_dome, None), ('plate', 'Плоская основа', 'plate', self.create_plate, None), ('fromphoto', 'Рельеф из фото', 'photo', self.create_relief, None), ('smooth', 'Сглаживание…', 'smooth', lambda: self.relief_op('smooth'), None), ('zero', 'Обнулить…', 'zero', lambda: self.relief_op('zero'), 'Shift+Delete'), ('fit', 'Показать модель целиком', 'fit', lambda: self.view.fit_all(), 'Home'), ('text', 'Текст в кривые…', 'text', self.add_text, None)]:
+        for key, label, glyph, slot, shortcut in [('new', 'Новый проект', 'new', self.new_project, 'Ctrl+N'), ('open', 'Открыть проект…', 'open', self.open_project, 'Ctrl+O'), ('save', 'Сохранить', 'save', self.save_project, 'Ctrl+S'), ('saveas', 'Сохранить как…', 'save', self.save_project_as, 'Ctrl+Shift+S'), ('undo', 'Отменить', 'undo', self.undo, 'Ctrl+Z'), ('redo', 'Повторить', 'redo', self.redo, 'Ctrl+Y'), ('copy', 'Создать копию', 'copy', self.copy_selected, 'Ctrl+D'), ('delete', 'Удалить выделенное', 'delete', self.delete_selected, None), ('transform', 'Размер, поворот и положение…', 'transform', self.transform_dialog, None), ('photo', 'Открыть фотографию…', 'photo', self.open_photo, 'Ctrl+I'), ('svg', 'Импорт SVG 1:1…', 'open', self.import_svg, None), ('dxf', 'Импорт DXF 1:1…', 'open', self.import_dxf, None), ('svgout', 'Экспорт SVG…', 'save', self.export_svg, None), ('stlin', 'Открыть STL…', 'stl', self.open_stl, None), ('stl', 'Экспорт STL…', 'stl', self.export_stl, 'Ctrl+E'), ('shape', 'Форма · F12', 'shape', self.open_relief_editor, 'F12'), ('sweep', 'Две направляющие', 'rails', self.open_sweep_dialog, None), ('dome', 'Купол', 'dome', self.create_dome, None), ('plate', 'Плоская основа', 'plate', self.create_plate, None), ('fromphoto', 'Рельеф из фото', 'photo', self.create_relief, None), ('smooth', 'Сглаживание…', 'smooth', lambda: self.relief_op('smooth'), None), ('zero', 'Обнулить…', 'zero', lambda: self.relief_op('zero'), 'Shift+Delete'), ('fit', 'Показать модель целиком', 'fit', self.fit_model, 'Home'), ('fit_selection', 'Приблизить выделенное · 2D', 'fit', self.fit_selection, 'Ctrl+Home'), ('text', 'Текст в кривые…', 'text', self.add_text, None)]:
             actions[key] = self._action(label, glyph, slot, shortcut)
         menus = {}
         for title in ('Файл', 'Правка', 'Вид', 'Модель', 'Векторы', 'Рельефы', 'Справка'):
             menus[title] = self.menuBar().addMenu(title)
         for key in ('new', 'open', 'save', 'saveas', 'photo', 'svg', 'dxf', 'svgout', 'stlin', 'stl'):
             menus['Файл'].addAction(actions[key])
+        self.recent_menu = QMenu('Недавние проекты', self)
+        self.recent_menu.setToolTipsVisible(True)
+        menus['Файл'].insertMenu(actions['save'], self.recent_menu)
+        self._refresh_recent_projects()
         menus['Файл'].addSeparator()
         menus['Файл'].addAction('Выход', self.close)
         for key in ('undo', 'redo', 'copy', 'delete', 'transform'):
@@ -4676,7 +4692,7 @@ class StoneStudio(Studio):
             menus['Рельефы'].addAction(title, lambda op=op: self.relief_op(op))
         menus['Рельефы'].addAction(actions['stl'])
         menus['Справка'].addAction(self._action('Справочник инструментов', 'new', self.open_help, 'F1'))
-        menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.2.'))
+        menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.3.'))
         filebar = self._toolbar('Проект и правка')
         for key in ('new', 'open', 'save', 'undo', 'redo', 'copy', 'delete', 'transform'):
             filebar.addAction(actions[key])
@@ -4712,7 +4728,9 @@ class StoneStudio(Studio):
         vectors.addAction(actions['text'])
         vectors.addSeparator()
         vectors.addAction(actions['fit'])
+        vectors.addAction(actions['fit_selection'])
         menus['Вид'].addAction(actions['fit'])
+        menus['Вид'].addAction(actions['fit_selection'])
         snapbar = self._toolbar('Привязки и точность')
         self.removeToolBar(snapbar)
         self.addToolBar(Qt.BottomToolBarArea, snapbar)
@@ -4750,6 +4768,9 @@ class StoneStudio(Studio):
         title = QLabel('РАЗМЕРЫ И ОСНОВА')
         title.setStyleSheet('font-weight:700;color:#628074;')
         form.addRow(title)
+        self.selection_info = QLabel('Выделите вектор — здесь появятся его размеры.')
+        self.selection_info.setWordWrap(True)
+        form.addRow(self.selection_info)
         for label, widget in [('Ширина', self.sp_w), ('Высота', self.sp_h), ('Основание', self.sp_base), ('Высота из фото', self.sp_depth), ('Шаг рельефа', self.sp_step), ('Шаг привязки', self.sp_grid)]:
             form.addRow(label, widget)
             widget.show()
@@ -4831,10 +4852,117 @@ class StoneStudio(Studio):
         camera.addItems(['Под углом', 'Сверху', 'Спереди', 'Слева', 'Справа', 'Сзади', 'Снизу'])
         camera.currentIndexChanged.connect(lambda i: self.set_view(('iso', 'top', 'front', 'left', 'right', 'back', 'bottom')[i]))
         camera_row.addWidget(camera)
+        fit_button = QToolButton()
+        fit_button.setDefaultAction(actions['fit'])
+        fit_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        camera_row.addWidget(fit_button)
         camera_row.addStretch(1)
         camera_row.addWidget(QLabel('Мышь — вращение · колесо — масштаб'))
         self.sp_w.setValue(300)
         self.sp_h.setValue(500)
+
+    def fit_model(self):
+        if self.tabs.currentIndex() == 1:
+            self._sculpt_release()
+            self.plotter.reset_camera()
+            self.plotter.render()
+        else:
+            self.view.fit_all()
+            self.update_rulers()
+
+    def _selected_bounds(self):
+        bounds = None
+        for item in self.sel_vectors():
+            rect = item.mapRectToScene(build_qpath(item.data).boundingRect())
+            if bounds is None:
+                bounds = QRectF(rect)
+            else:
+                left, top = (min(bounds.left(), rect.left()), min(bounds.top(), rect.top()))
+                right, bottom = (max(bounds.right(), rect.right()), max(bounds.bottom(), rect.bottom()))
+                bounds = QRectF(left, top, right - left, bottom - top)
+        return bounds
+
+    def fit_selection(self):
+        bounds = self._selected_bounds()
+        if bounds is None:
+            self.statusBar().showMessage('Сначала выделите один или несколько векторов в 2D.')
+            return
+        self._sculpt_release()
+        self.tabs.setCurrentIndex(0)
+        margin = max(bounds.width(), bounds.height()) * 0.12 + self.K
+        self.view.fitInView(bounds.adjusted(-margin, -margin, margin, margin), Qt.KeepAspectRatio)
+        self.update_rulers()
+
+    def update_selection_ui(self):
+        super().update_selection_ui()
+        if not hasattr(self, 'selection_info'):
+            return
+        bounds = self._selected_bounds()
+        if bounds is None:
+            self.selection_info.setText('Выделите вектор — здесь появятся его размеры.')
+        else:
+            count = len(self.sel_vectors())
+            self.selection_info.setText(f'Выделено векторов: {count}\nРазмер: {bounds.width() / self.K:.2f} × {bounds.height() / self.K:.2f} мм\nЛевый нижний угол: X {bounds.left() / self.K:.2f}; Y {self.sp_h.value() - bounds.bottom() / self.K:.2f} мм')
+        self._shell_actions['fit_selection'].setEnabled(bounds is not None)
+
+    def _refresh_recent_projects(self):
+        self.recent_menu.clear()
+        if not self._recent_projects:
+            self.recent_menu.addAction('Пока нет проектов').setEnabled(False)
+            return
+        for path in self._recent_projects:
+            action = self.recent_menu.addAction(os.path.basename(path).replace('&', '&&'))
+            action.setToolTip(path)
+            action.setStatusTip(path)
+            action.setData(path)
+            action.triggered.connect(lambda checked=False, p=path: self.open_project(p))
+        self.recent_menu.addSeparator()
+        self.recent_menu.addAction('Очистить список', self._clear_recent_projects)
+
+    def _remember_project(self, path):
+        path = os.path.abspath(path)
+        self._recent_projects = [path] + [p for p in self._recent_projects if os.path.normcase(p) != os.path.normcase(path)]
+        self._recent_projects = self._recent_projects[:6]
+        self.settings.setValue('recentProjects', json.dumps(self._recent_projects, ensure_ascii=False))
+        self._refresh_recent_projects()
+
+    def _clear_recent_projects(self):
+        self._recent_projects = []
+        self.settings.setValue('recentProjects', '[]')
+        self._refresh_recent_projects()
+
+    def _restore_user_preferences(self):
+        try:
+            data = json.loads(str(self.settings.value('userPreferences', '{}')))
+        except (ValueError, TypeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        for key, widget in [('radius', self.sculpt_radius), ('gain', self.sculpt_gain)]:
+            value = data.get(key)
+            if type(value) in (int, float) and widget.minimum() <= value <= widget.maximum():
+                widget.setValue(value)
+        for key, widget in [('fixed', self.sculpt_fixed), ('protect_base', self.sculpt_protect_base)]:
+            if type(data.get(key)) is bool:
+                widget.setChecked(data[key])
+        index = data.get('nudge')
+        if type(index) is int and 0 <= index < self.nudge.count():
+            self.nudge.setCurrentIndex(index)
+        for key, action in self.snap_actions.items():
+            if type(data.get(key)) is bool:
+                action.setChecked(data[key])
+        for widget in (self.sculpt_radius, self.sculpt_gain):
+            widget.valueChanged.connect(self._save_user_preferences)
+        for widget in (self.sculpt_fixed, self.sculpt_protect_base):
+            widget.toggled.connect(self._save_user_preferences)
+        self.nudge.currentIndexChanged.connect(self._save_user_preferences)
+        for action in self.snap_actions.values():
+            action.toggled.connect(self._save_user_preferences)
+        self.update_selection_ui()
+
+    def _save_user_preferences(self, *_):
+        data = dict(radius=self.sculpt_radius.value(), gain=self.sculpt_gain.value(), fixed=self.sculpt_fixed.isChecked(), protect_base=self.sculpt_protect_base.isChecked(), nudge=self.nudge.currentIndex(), **{k: a.isChecked() for k, a in self.snap_actions.items()})
+        self.settings.setValue('userPreferences', json.dumps(data))
 
     def show_inspector(self, index):
         self.inspector.show()
@@ -5110,7 +5238,10 @@ class StoneStudio(Studio):
 
     def _write(self, path):
         self._sculpt_release()
-        return super()._write(path)
+        saved = super()._write(path)
+        if saved:
+            self._remember_project(path)
+        return saved
 
     def confirm_discard(self):
         self._sculpt_release()
@@ -5150,6 +5281,7 @@ class StoneStudio(Studio):
             self._restore_parameters(self._loaded_project_settings.get('workspace', {}))
             self.update_rulers()
             self._saved_sig = self.state_sig()
+            self._remember_project(path)
             return True
         return False
 
