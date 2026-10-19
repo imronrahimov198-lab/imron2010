@@ -848,7 +848,7 @@ def combine_relief(z, shape, weight, base, mode):
         rn = np.zeros_like(r)
     else:
         raise ValueError('Неизвестный режим слияния')
-    return np.maximum(base + r + weight * (rn - r), 0.05)
+    return np.where(np.asarray(weight)>0, np.maximum(base + r + weight * (rn - r), 0.05), z)
 
 
 def load_image_any(raw):
@@ -1026,7 +1026,7 @@ from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QIcon, QImage,
                            QMouseEvent, QPainter, QPainterPath, QPainterPathStroker, QPen,
                            QPixmap, QPolygonF, QShortcut)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-                               QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
+                               QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout,
                                QGraphicsItem, QGraphicsEllipseItem, QGraphicsPathItem,
                                QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
                                QHBoxLayout, QLabel, QListWidget, QMainWindow, QMenu,
@@ -1036,7 +1036,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
                                QTabWidget, QTextBrowser, QToolBar, QToolButton, QVBoxLayout,
                                QWidget)
 
-APP = 'Stone Relief Studio Pro 3.3.1'
+APP = 'Stone Relief Studio Pro 3.4.0'
 
 
 # ============================================================ Qt: помощники ==
@@ -1783,7 +1783,13 @@ class Studio(QMainWindow):
 
     @z.setter
     def z(self, v):
-        self._z = None if v is None else np.asarray(v, dtype=np.float32)
+        if v is None:
+            self._z=None
+        else:
+            array=np.asarray(v)
+            # Keep the precision of computed/loaded heights. Forcing float32
+            # here made Apply differ from the float64 preview and its Z report.
+            self._z=array if array.dtype in (np.dtype('float32'),np.dtype('float64')) else array.astype(np.float64)
 
     def __init__(self):
         super().__init__()
@@ -2431,7 +2437,7 @@ class Studio(QMainWindow):
         if self.photo_pil is None or self.canvas_w <= 0:
             self.view.set_photo(None)
             return
-        if self.photo_arr is None or self.photo_arr.shape[1] != int(self.canvas_w):
+        if self.photo_arr is None or self.photo_arr.shape[:2] != (max(2,int(self.canvas_h)),max(2,int(self.canvas_w))):
             self.photo_arr = np.asarray(self.photo_pil.resize((max(2, int(self.canvas_w)), max(2, int(self.canvas_h))),
                                                               LANCZOS), dtype=np.float32)
         f = self.sl_photo.value() / 100.0
@@ -2449,9 +2455,8 @@ class Studio(QMainWindow):
         self._check_free_preview()
         W, H = self.sp_w.value(), self.sp_h.value()
         nx, ny = self.grid_dims(W, H)
-        from relief_geometry import photo_heights
         try:
-            h = photo_heights(self.photo_bytes, nx, ny, self.sp_blur.value(), self.chk_invert.isChecked())
+            h = self.photo_values(nx,ny)
         except ValueError as ex:
             QMessageBox.warning(self, 'Карта высот', str(ex))
             return
@@ -3085,7 +3090,8 @@ class Studio(QMainWindow):
     # ---------------------------------------------- Редактор формы (F12) -------
     SH_MODES = [('Добавить', 'add'), ('Вычитание', 'sub'), ('Обнул. внутри', 'zero_in'),
                 ('По наибольш.', 'high'), ('По наименьш.', 'low'), ('Обнул. снаружи', 'zero_out'),
-                ('Заменить', 'replace')]
+                ('Заменить', 'replace'), ('Поднять на N мм', 'raise'), ('Опустить на N мм', 'lower'),
+                ('Наклон', 'tilt'), ('Выпуклость', 'convex'), ('Вогнутость', 'concave')]
 
     def open_relief_editor(self):
         if self.relief_dialog is None:
@@ -3159,6 +3165,15 @@ class Studio(QMainWindow):
         form.addRow(self.sh_r_limit, self.sh_limit)
         form.addRow(self.sh_r_scale, self.sh_scaleh)
         form.addRow(self.sh_r_const, self.sh_const)
+        self.sh_delta = self._spin(5,0,500,4)
+        self.sh_direction = self._spin(90,-180,180,2,'°')
+        self.sh_preserve = QCheckBox('СОХРАНИТЬ ДЕТАЛИ')
+        self.sh_preserve.setToolTip('Для Replace / Highest / Lowest сохраняет фактуру мельче указанного радиуса. Подъём, опускание и добавление всегда сохраняют исходные детали.')
+        self.sh_detail_radius = self._spin(2,.1,100,3)
+        form.addRow('Подъём / опускание / перепад, мм', self.sh_delta)
+        form.addRow('Направление уклона, °', self.sh_direction)
+        form.addRow(self.sh_preserve)
+        form.addRow('Радиус отделения деталей, мм', self.sh_detail_radius)
         root.addWidget(box)
         self.sh_modegrp = QButtonGroup(d)
         self.sh_mode_btns = []
@@ -3182,11 +3197,14 @@ class Studio(QMainWindow):
         root.addWidget(self.sh_report)
         row = QHBoxLayout()
         for text, slot in [('Применить', lambda: self.shape_apply()), ('Предпросмотр', lambda: self.shape_apply(True)),
-                           ('Сброс', self.sh_reset), ('Закрыть', d.hide)]:
+                           ('Отмена', self.cancel_preview), ('Сброс', self.sh_reset), ('Закрыть', d.hide)]:
             b = QPushButton(text)
             b.clicked.connect(slot)
             row.addWidget(b)
         root.addLayout(row)
+        self.sh_add_apply_button = QPushButton('Добавить и применить')
+        self.sh_add_apply_button.clicked.connect(self.sh_add_and_apply)
+        root.addWidget(self.sh_add_apply_button)
         self.sh_timer = QTimer(self)
         self.sh_timer.setSingleShot(True)
         self.sh_timer.timeout.connect(lambda: self.shape_apply(True))
@@ -3194,10 +3212,13 @@ class Studio(QMainWindow):
         self.sh_angle_sl.valueChanged.connect(self.sh_angle.setValue)
         self.sh_angle.valueChanged.connect(self.sh_update)
         self.sh_scale_sl.valueChanged.connect(self.sh_update)
-        for w in (self.sh_start, self.sh_limit, self.sh_scaleh, self.sh_const, self.sh_exact):
+        for w in (self.sh_start, self.sh_limit, self.sh_scaleh, self.sh_const, self.sh_exact,
+                  self.sh_delta, self.sh_direction, self.sh_detail_radius):
             w.valueChanged.connect(self.sh_update)
         for w in (self.sh_r_exact, self.sh_r_free, self.sh_r_limit, self.sh_r_scale, self.sh_r_const) + tuple(self.sh_mode_btns):
             w.toggled.connect(self.sh_update)
+        self.sh_preserve.toggled.connect(self.sh_update)
+        self.sh_source.currentIndexChanged.connect(self.sh_update)
         self.sh_set_kind(0)
         return d
 
@@ -3214,6 +3235,28 @@ class Studio(QMainWindow):
         self.sh_exact.setEnabled(exact)
         self.sh_scale_lb.setText(f'Масштаб геометрии ×{self.sh_scale_sl.value() / 10.0:.1f}' if free else 'Высота в мм: масштаб ×1')
         self.sh_mode_label.setText('Операция: ' + dict((k,n) for n,k in self.SH_MODES)[self.sh_mode_key()] + ' → Применить')
+        mode=self.sh_mode_key()
+        if mode in ('convex','concave') and not self.sh_r_exact.isChecked():
+            self.sh_r_exact.setChecked(True)
+        form_mode=mode in ('add','sub','high','low','replace')
+        profile_mode=form_mode and self.sh_source.currentIndex()==0
+        self.sh_source.setEnabled(form_mode)
+        for radio in (self.sh_r_exact,self.sh_r_free,self.sh_r_limit,self.sh_r_scale,self.sh_r_const):
+            radio.setEnabled(form_mode)
+        self.sh_exact.setEnabled((form_mode and self.sh_r_exact.isChecked()) or mode in ('convex','concave'))
+        self.sh_limit.setEnabled(form_mode and self.sh_r_limit.isChecked())
+        self.sh_scaleh.setEnabled(form_mode and self.sh_r_scale.isChecked())
+        self.sh_const.setEnabled(form_mode and self.sh_r_const.isChecked())
+        self.sh_scale_sl.setEnabled(form_mode and free)
+        self.sh_start.setEnabled(form_mode or mode=='tilt')
+        for widget in tuple(self.sh_kind_btns):
+            widget.setEnabled(profile_mode)
+        self.sh_angle.setEnabled(profile_mode or mode in ('convex','concave'))
+        self.sh_angle_sl.setEnabled(self.sh_angle.isEnabled())
+        self.sh_preserve.setEnabled(mode in ('replace','high','low'))
+        self.sh_delta.setEnabled(mode in ('raise','lower','tilt'))
+        self.sh_direction.setEnabled(mode=='tilt')
+        self.sh_detail_radius.setEnabled(self.sh_preserve.isChecked() and mode in ('replace','high','low'))
         self.sh_view.set_params(self.sh_kind, self.sh_angle.value())
         if self.sh_preview_flag and self.preview_active:
             self.sh_timer.start(250)
@@ -3228,9 +3271,15 @@ class Studio(QMainWindow):
         self.sh_limit.setValue(1)
         self.sh_scaleh.setValue(1)
         self.sh_const.setValue(0)
+        self.sh_delta.setValue(5); self.sh_direction.setValue(90)
+        self.sh_preserve.setChecked(False); self.sh_detail_radius.setValue(2)
         self.sh_mode_btns[0].setChecked(True)
         self.sh_preview_flag = False
         self.cancel_preview()
+
+    def sh_add_and_apply(self):
+        self.sh_mode_btns[0].setChecked(True)
+        return self.shape_apply()
 
     def sh_mode_key(self):
         for (_, key), b in zip(self.SH_MODES, self.sh_mode_btns):
@@ -3253,12 +3302,22 @@ class Studio(QMainWindow):
         if self.photo_pil is None:
             raise ValueError('Нет фото: откройте фотографию (Ctrl+I).')
         ny, nx = self.z.shape
+        return self.sp_depth.value() * self.photo_values(nx,ny)
+
+    def photo_values(self,nx,ny):
         from relief_geometry import photo_heights
-        h = photo_heights(self.photo_bytes, nx, ny, self.sp_blur.value(), self.chk_invert.isChecked())
-        return self.sp_depth.value() * h
+        from relief_editing import resample_world_grid
+        frame=getattr(self,'photo_frame',None)
+        if frame is None:
+            return photo_heights(self.photo_bytes,nx,ny,self.sp_blur.value(),self.chk_invert.isChecked())
+        W,H=self.sp_w.value(),self.sp_h.value()
+        snx,sny,_=grid_from_step(frame[2],frame[3],min(W/(nx-1),H/(ny-1)),max_cells=8000000)
+        photo=photo_heights(self.photo_bytes,snx,sny,self.sp_blur.value(),self.chk_invert.isChecked())
+        return resample_world_grid(photo,frame,(0,0,W,H),(ny,nx),fill=0.)
 
     @busy
     def shape_apply(self, preview=False):
+        from relief_editing import reset_relief_region, slope_delta, relief_details
         if not preview:
             self.sh_timer.stop()
         try:
@@ -3269,44 +3328,73 @@ class Studio(QMainWindow):
             cx, cy = self.cell()
             names = dict((k, n) for n, k in self.SH_MODES)
             label = 'Редактор формы: ' + names[mode].lower()
+            shape = np.zeros_like(self.z)
             if mode == 'zero_in':
-                newz = combine_relief(self.z, np.zeros(self.z.shape), cov, base, 'zero')
-                weight = cov
+                newz, weight = reset_relief_region(self.z,cov,base)
             elif mode == 'zero_out':
-                weight = 1.0 - cov
-                newz = combine_relief(self.z, np.zeros(self.z.shape), weight, base, 'zero')
+                newz, weight = reset_relief_region(self.z,cov,base,outside=True)
+            elif mode in ('raise','lower','tilt','convex','concave'):
+                if mode in ('raise','lower'):
+                    shape = np.full_like(self.z,self.sh_delta.value())
+                elif mode == 'tilt':
+                    shape = slope_delta(cov,cx,cy,self.sh_delta.value(),self.sh_direction.value(),self.sh_start.value())
+                else:
+                    shape = build_shape(cov,cx,cy,'round',abs(self.sh_angle.value()),'exact',self.sh_exact.value())
+                weight = cov
+                newz = combine_relief(self.z,shape,weight,base,'sub' if mode in ('lower','concave') else 'add')
             else:
                 if self.sh_source.currentIndex() == 1:
-                    shape = self.photo_shape()
-                    if self.sh_r_exact.isChecked():
+                    shape = np.asarray(self.photo_shape(),dtype=np.float64)
+                    hm,val=self.sh_height_mode()
+                    if hm in ('exact','scale'):
                         peak = float(np.max(shape*cov))
-                        shape = shape*(self.sh_exact.value()/peak) if peak > 0 else np.zeros_like(shape)
-                        shape = np.where(cov > .001, self.sh_start.value()+shape, 0.)
+                        shape = shape*(abs(val)/peak) if peak > 0 else np.zeros_like(shape)
+                    elif hm=='limit':
+                        shape=np.clip(shape,-abs(val),abs(val))
+                    elif hm=='const':
+                        shape=np.full_like(shape,val)
+                    else:
+                        shape=shape*(self.sh_scale_sl.value()/10.)
+                    shape = np.where(cov > .001, self.sh_start.value()+shape, 0.)
                 else:
                     hm, val = self.sh_height_mode()
                     shape = build_shape(cov, cx, cy, ['round', 'angular', 'plateau'][self.sh_kind],
                                         self.sh_angle.value(), hm, val, self.sh_start.value(),
                                         self.sh_scale_sl.value() / 10.0)
                 weight = cov
-                newz = combine_relief(self.z, shape, weight, base, mode)
+                if self.sh_preserve.isChecked() and mode in ('replace','high','low'):
+                    details = relief_details(self.z,cov,base,cx,cy,self.sh_detail_radius.value())
+                    # Combine macro shapes, then restore exactly the original
+                    # residual. This does not blur or repeatedly add the texture.
+                    macro = self.z-details
+                    newz = combine_relief(macro,shape,weight,base,mode)+details
+                    newz = np.where(weight>0,np.maximum(newz,.05),self.z)
+                else:
+                    newz = combine_relief(self.z, shape, weight, base, mode)
         except ValueError as e:
             QMessageBox.information(self, 'Редактор формы', str(e))
             return
         before_z, after_z = float(self.z.max()), float(newz.max())
+        before_min, after_min = float(self.z.min()), float(newz.min())
         delta = float(np.max(np.abs(newz - self.z)))
-        shape_peak = float(np.max(shape * cov)) if mode not in ('zero_in', 'zero_out') else 0.0
-        shape_min = float(np.min(shape * cov)) if mode not in ('zero_in', 'zero_out') else 0.0
+        signed_shape = -shape if mode in ('lower','concave') else shape
+        shape_peak = float(np.max(signed_shape * cov)) if mode not in ('zero_in', 'zero_out') else 0.0
+        shape_min = float(np.min(signed_shape * cov)) if mode not in ('zero_in', 'zero_out') else 0.0
         self.sh_last_report = dict(before_z=before_z, after_z=after_z, shape_height=shape_peak,
+                                   before_min=before_min, after_min=after_min,
                                    shape_min=shape_min, max_change=delta, relief_height=after_z-base)
         report = (f'Форма относительно верха основания: {shape_min:.4f} … {shape_peak:.4f} мм; основание: {base:.4f} мм.\n'
                   f'Реальный Z max: {before_z:.4f} → {after_z:.4f} мм; '
-                  f'итог над основанием: {after_z-base:.4f} мм.\nМаксимальное изменение: {delta:.4f} мм. 3D XYZ 1:1.')
-        exceeds = mode == 'add' and after_z-base > self.sp_depth.value()+1e-7
+                  f'Z min: {before_min:.4f} → {after_min:.4f} мм.\n'
+                  f'Итог над основанием: {after_z-base:.4f} мм. Максимальное изменение: {delta:.4f} мм. 3D XYZ 1:1.')
+        if mode in ('lower','concave') and after_min <= .05:
+            report += '\nДостигнут минимальный Z=0,05 мм: дальнейшее углубление ограничено.'
+        exceeds = mode in ('add','raise','tilt','convex') and after_z-base > self.sp_depth.value()+1e-7
         if exceeds:
             report += f'\nВНИМАНИЕ: итог превышает заданную высоту рельефа {self.sp_depth.value():.4f} мм.'
         self.sh_report.setText(report)
         if exceeds and not preview:
-            answer = QMessageBox.question(self, 'Превышение высоты рельефа', report + '\nПрименить сложение?',
+            answer = QMessageBox.question(self, 'Превышение высоты рельефа', report + '\nПрименить операцию?',
                                           QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if answer != QMessageBox.Yes:
                 return
@@ -3355,13 +3443,18 @@ class Studio(QMainWindow):
         self.sweep_dialog.raise_()
         self.sweep_dialog.activateWindow()
 
-    def _build_sweep_dialog(self):
-        d = QDialog(self)
+    def _build_sweep_dialog(self, dock=False):
+        d = QDockWidget('Вытягивание по двум направляющим',self) if dock else QDialog(self)
         d.setWindowTitle('Вытягивание по двум направляющим')
-        d.setWindowFlags(d.windowFlags() | Qt.Tool)
+        if not dock:
+            d.setWindowFlags(d.windowFlags() | Qt.Tool)
         d.resize(510, 590)
         d.setMinimumSize(350, 260)
-        outer = QVBoxLayout(d)
+        if dock:
+            container=QWidget(d); d.setWidget(container)
+        else:
+            container=d
+        outer = QVBoxLayout(container)
         outer.setContentsMargins(5, 5, 5, 5)
         scroll = QScrollArea(d)
         scroll.setWidgetResizable(True)
@@ -3378,8 +3471,12 @@ class Studio(QMainWindow):
         lay.addWidget(intro)
         lay.addWidget(QLabel('<b>Выбор векторов</b>'))
         form = QFormLayout()
+        self.sw_pick_buttons={}
+        if dock:
+            form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         for text, which in [('Верхняя направляющая', 'top'), ('Нижняя направляющая', 'bottom')]:
             b = QPushButton('Выбор')
+            self.sw_pick_buttons[which]=b
             b.clicked.connect(lambda _=False, w=which: self.sw_begin_pick(w))
             form.addRow(text, b)
         flips = QHBoxLayout()
@@ -3388,6 +3485,7 @@ class Studio(QMainWindow):
         flips.addWidget(self.sw_flip2)
         form.addRow('Развернуть направляющие', flips)
         bz = QPushButton('Выбор')
+        self.sw_pick_buttons['z']=bz
         bz.clicked.connect(lambda: self.sw_begin_pick('z'))
         form.addRow('Граница по Z', bz)
         self.sw_use_z = QCheckBox('Кривая изменения высоты по Z')
@@ -3406,12 +3504,15 @@ class Studio(QMainWindow):
         editpos.setToolTip('Можно также дважды нажать на сечение в списке')
         editpos.clicked.connect(self.sw_edit_position)
         lay.addWidget(editpos)
-        row = QHBoxLayout()
-        for text, slot in [('Добавить сечение', lambda: self.sw_begin_pick('section')), ('Вставить сечение', lambda: self.sw_begin_pick('insert')),
-                           ('Удалить сечение', self.sw_remove)]:
+        row = QGridLayout() if dock else QHBoxLayout()
+        for i,(text, slot) in enumerate([('Добавить сечение', lambda: self.sw_begin_pick('section')), ('Вставить сечение', lambda: self.sw_begin_pick('insert')),
+                           ('Удалить сечение', self.sw_remove)]):
             b = QPushButton(text)
             b.clicked.connect(slot)
-            row.addWidget(b)
+            if dock:
+                row.addWidget(b,i//2,i%2)
+            else:
+                row.addWidget(b)
         lay.addLayout(row)
         self.sw_trans = QCheckBox('Переход между сечениями')
         self.sw_trans.setChecked(True)
@@ -3422,7 +3523,7 @@ class Studio(QMainWindow):
         self.sw_start = self._spin(0, -500, 500, 2)
         lay.addWidget(self.sw_trans)
         lay.addWidget(self.sw_scalew)
-        r = QHBoxLayout()
+        r = QVBoxLayout() if dock else QHBoxLayout()
         r.addWidget(self.sw_scaleend)
         r.addWidget(self.sw_end)
         lay.addLayout(r)
@@ -3453,10 +3554,11 @@ class Studio(QMainWindow):
         return d
 
     def sw_begin_pick(self, which):
-        """Спрятать диалог, чтобы можно было действительно выбрать вектор мышью в 2D."""
+        """Pick directly in 2D while the modeless tool remains visible."""
         self._sw_pending_pick = which
         self.scene.clearSelection()
-        self.sweep_dialog.hide()
+        self.sweep_dialog.show()
+        self.sweep_dialog.raise_()
         self.tabs.setCurrentIndex(0)
         self.set_tool('select')
         self.view.setFocus()
@@ -3567,6 +3669,10 @@ class Studio(QMainWindow):
                 self.sw_rails[i] = None
         if not self._alive(self.sw_zb):
             self.sw_zb = None
+        for key,item in [('top',self.sw_rails[0]),('bottom',self.sw_rails[1]),('z',self.sw_zb)]:
+            if key in getattr(self,'sw_pick_buttons',{}):
+                self.sw_pick_buttons[key].setText('Выбор' if item is None else 'Выбор · '+item.data.uid[:8])
+                self.sw_pick_buttons[key].setToolTip('Щёлкните открытый вектор в 2D' if item is None else 'Назначен вектор '+item.data.uid+'; нажмите для замены')
         for vector in self.view.vectors():
             vector.sweep_role = ('top' if vector is self.sw_rails[0] else
                                  'bottom' if vector is self.sw_rails[1] else
@@ -4392,13 +4498,18 @@ BOOK = [
       'Угол меняет профиль. Множитель действует только в режиме «По углу и ширине»; в этом режиме высота может быть большой.',
       'Выберите операцию (зелёная кнопка): Добавить, Вычитание, По наибольш., По наименьш., Заменить, Обнул. внутри или снаружи.',
       '«Добавить» выбирает сложение, «Применить» выполняет его. Смотрите Z до/после в мм; повторное сложение накапливает высоту.',
+      'На готовом рельефе из фото используйте «Поднять/Опустить на N мм»: в поле перепада задайте, например, 5 мм. Прожилки сохраняются.',
+      '«Наклон» задаёт перепад в мм и направление в XY; выпуклость/вогнутость добавляют гладкую деформацию к существующей форме.',
+      '«СОХРАНИТЬ ДЕТАЛИ» у Replace/Highest/Lowest возвращает мелкую фактуру; радиус отделения задаётся в мм. Для Add и подъёма фактура сохраняется автоматически.',
+      'Обнуление внутри/снаружи возвращает к верху основания. При основании 5 мм обнулённые ячейки имеют Z=5 мм.',
+      '«Добавить и применить» сразу выполняет сложение. «Отмена» убирает временный предпросмотр; Ctrl+Z отменяет уже применённое.',
       '«Предпросмотр» показывает результат, «Применить» меняет рельеф, «Сброс» возвращает настройки.'],
      ['F12 — открыть окно', 'Ctrl+Z — отмена'],
      'Округлый лепесток: угол 45°, «Точная высота в мм» 2 мм, действие «Добавить» → «Применить». 3D отображается в масштабе XYZ 1:1.'),
     ('sweep', 'Вытягивание по двум направляющим',
      'Создать рельеф вытягиванием одного или нескольких сечений вдоль двух направляющих; результат объединяется с рельефом.',
      ['Нарисуйте открытые векторы: верхнюю и нижнюю направляющие и одно или несколько сечений.',
-      'Нажмите «Верхняя направляющая — Выбор», затем один раз щёлкните открытый вектор в 2D. Окно вернётся автоматически; Enter не нужен.',
+      'Нажмите «Верхняя направляющая — Выбор», затем один раз щёлкните открытый вектор в 2D. Закрепляемая панель остаётся видимой; Enter не нужен. Назначенный UID появится в поле.',
       'Так же назначьте вторую направляющую, границу Z и сечения. Синяя линия — первая, оранжевая — вторая, фиолетовые — сечения; Esc отменяет выбор.',
       '«Развернуть направляющие» меняет направление, «Переход между сечениями» плавно смешивает сечения.',
       '«Масштабировать высоту по ширине», «Начальная высота» и «Масштабировать конечную высоту» задают высоту.',

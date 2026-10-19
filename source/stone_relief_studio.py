@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QKeySequence,
-                           QPainter, QPainterPath, QPen)
+                           QPainter, QPainterPath, QPen, QTransform)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
                                QDockWidget, QDoubleSpinBox, QFileDialog,
                                QFontComboBox, QFormLayout, QGridLayout,
@@ -121,6 +121,7 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         self._polygon_sides = 6
         self._stroke = None
         self._preview_tool = None
+        self.photo_frame = None
         self.settings = QSettings('StoneReliefStudio', 'Workspace')
         self._recent_projects = []
         try:
@@ -136,7 +137,7 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         super().__init__()
         self.setStyleSheet(STYLE)
         self.setWindowIcon(icon('dome', True))
-        self.setWindowTitle('Stone Relief Studio Pro 3.3.1 — векторы и рельеф')
+        self.setWindowTitle('Stone Relief Studio Pro 3.4.0 — векторы и рельеф')
         self.resize(1440, 940)
         self.sweep_dialog = self._build_sweep_dialog()
         self.relief_dialog = self._build_shape_dialog()
@@ -253,7 +254,7 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         self.help_button.clicked.connect(self.open_help)
         self.menuBar().setCornerWidget(self.help_button,Qt.TopRightCorner)
         menus['Справка'].addAction('О программе', lambda:QMessageBox.information(self, 'Stone Relief Studio',
-            'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.3.1.'))
+            'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.4.0.'))
 
         filebar = self._toolbar('Проект и правка')
         for key in ('new','open','save','undo','redo','copy','delete','transform'):
@@ -397,6 +398,11 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         self.view.verticalScrollBar().valueChanged.connect(self.update_rulers)
         self.coords=QLabel('X 0,00   Y 0,00 мм')
         self.statusBar().addPermanentWidget(self.coords)
+        self.model_status=QLabel()
+        self.model_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.statusBar().addPermanentWidget(self.model_status)
+        for widget in (self.sp_w,self.sp_h,self.sp_base,self.sp_depth,self.sp_step):
+            widget.valueChanged.connect(self.update_model_status)
         self.tabs.setTabText(0,'Чертёж · 2D'); self.tabs.setTabText(1,'Поверхность · 3D')
         self.plotter.set_background('#64777c',top='#b7c6c5')
         camera_row=self.tabs.widget(1).layout().itemAt(0).layout()
@@ -453,6 +459,7 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
 
     def update_selection_ui(self):
         super().update_selection_ui()
+        self.update_model_status()
         if not hasattr(self, 'selection_info'):
             return
         bounds = self._selected_bounds()
@@ -465,6 +472,35 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
                 f'Левый нижний угол: X {bounds.left()/self.K:.2f}; '
                 f'Y {self.sp_h.value()-bounds.bottom()/self.K:.2f} мм')
         self._shell_actions['fit_selection'].setEnabled(bounds is not None)
+
+    def update_model_status(self,*_):
+        if not hasattr(self,'model_status'):
+            return
+        nx,ny,used=core.grid_from_step(self.sp_w.value(),self.sp_h.value(),self.sp_step.value())
+        if self.z is not None:
+            ny,nx=self.z.shape
+        self.model_status.setText(f'{self.sp_w.value():g} × {self.sp_h.value():g} мм | осн. {self.sp_base.value():g} мм | '
+                                  f'задан. рельеф {self.sp_depth.value():g} мм\nСетка {nx} × {ny} | '
+                                  f'шаг {self.sp_w.value()/(nx-1):.4g} × {self.sp_h.value()/(ny-1):.4g} мм')
+
+    def update_photo_view(self,*args):
+        super().update_photo_view(*args)
+        item=self.view.photo_item
+        item.setTransform(QTransform()); item.setPos(0,0)
+        if self.photo_pil is not None and self.photo_frame is not None:
+            x,y,w,h=self.photo_frame
+            item.setTransform(QTransform.fromScale(w/self.sp_w.value(),h/self.sp_h.value()))
+            item.setPos(x*self.K,(self.sp_h.value()-y-h)*self.K)
+
+    def open_photo(self,path=None):
+        if super().open_photo(path):
+            self.photo_frame=None; self.update_photo_view()
+            return True
+        return False
+
+    def _clear_all(self):
+        super()._clear_all()
+        self.photo_frame=None
 
     def _refresh_recent_projects(self):
         self.recent_menu.clear()
@@ -662,12 +698,14 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         self.push_history('Текст в кривые',snap); self.after_change(); self.tabs.setCurrentIndex(0)
 
     def _build_sweep_dialog(self):
-        dialog=super()._build_sweep_dialog()
+        dialog=super()._build_sweep_dialog(dock=True)
         dialog.setWindowTitle('Поверхность по двум направляющим')
-        dialog.setSizeGripEnabled(True); dialog.resize(560,720)
-        dialog.setModal(False)
+        dialog.setObjectName('twoRailSweepDock')
+        dialog.setAllowedAreas(Qt.LeftDockWidgetArea|Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.RightDockWidgetArea,dialog)
+        self.tabifyDockWidget(self.inspector,dialog)
         intro=dialog.findChildren(QLabel)[0]
-        intro.setText('1. Нажмите «Выбор», затем один раз щёлкните открытый вектор в 2D — Enter не нужен.\n'
+        intro.setText('1. Нажмите «Выбор», затем один раз щёлкните открытый вектор в 2D — панель остаётся открытой, Enter не нужен.\n'
                       'Первая направляющая синяя, вторая оранжевая; сечения фиолетовые.\n'
                       '2. Добавьте поперечные сечения и задайте их положение.\n3. Проверьте поверхность в 3D и примените результат.')
         for b in dialog.findChildren(QPushButton):
@@ -676,12 +714,15 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         scroll=dialog.findChild(QScrollArea)
         layout=scroll.widget().layout()
         footer=layout.takeAt(layout.count()-1).layout()
-        row=QHBoxLayout()
+        row=QGridLayout()
+        i=0
         while footer.count():
             item=footer.takeAt(0)
-            if item.widget(): row.addWidget(item.widget())
-        dialog.layout().addLayout(row)
+            if item.widget():
+                row.addWidget(item.widget(),i//2,i%2); i+=1
+        dialog.widget().layout().addLayout(row)
         dialog.installEventFilter(self)
+        dialog.hide()
         return dialog
 
     def _build_shape_dialog(self):
@@ -689,10 +730,17 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         dialog.setWindowTitle('Форма и высота · F12'); dialog.setModal(False)
         dialog.setSizeGripEnabled(True); dialog.setMinimumSize(440,480); dialog.resize(590,630)
         # Existing controls remain connected; the scroll area makes every action reachable.
+        quick=dialog.layout().takeAt(dialog.layout().count()-1).widget()
+        footer=dialog.layout().takeAt(dialog.layout().count()-1).layout()
         content=QWidget()
         content.setLayout(dialog.layout())
         layout=QVBoxLayout(dialog)
-        scroll=QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(content); layout.addWidget(scroll)
+        content.layout().removeWidget(self.sh_mode_label)
+        content.layout().removeWidget(self.sh_report)
+        layout.addWidget(self.sh_mode_label)
+        scroll=QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(content); layout.addWidget(scroll,1)
+        layout.addWidget(self.sh_report)
+        layout.addLayout(footer); layout.addWidget(quick)
         for i,b in enumerate(self.sh_kind_btns):
             b.setText(''); b.setIcon(icon(('dome','polygon','plate')[i],True)); b.setIconSize(QSize(34,34))
         for b in dialog.findChildren(QPushButton):
@@ -722,9 +770,13 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
                       scale=self.sh_scale_sl.value(),limit=self.sh_limit.value(),height=self.sh_scaleh.value(),
                       const=self.sh_const.value(),height_mode=self.sh_height_mode()[0],combine=self.sh_mode_key())
             form['exact'] = self.sh_exact.value()
-        return dict(sweep=self.sweep_state(),form=form)
+            form.update(delta=self.sh_delta.value(),direction=self.sh_direction.value(),
+                        preserve=self.sh_preserve.isChecked(),detail_radius=self.sh_detail_radius.value())
+        return dict(sweep=self.sweep_state(),form=form,photo_frame=self.photo_frame)
 
     def _restore_parameters(self, data, bind=True):
+        if bind:
+            self.photo_frame=data.get('photo_frame')
         state=data.get('sweep',{})
         if hasattr(self,'sw_flip1'):
             for key,widget in [('flip1',self.sw_flip1),('flip2',self.sw_flip2),('use_z',self.sw_use_z),
@@ -742,11 +794,15 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         if form and hasattr(self,'sh_kind'):
             self.sh_set_kind(int(form.get('kind',0)))
             for key,widget in [('angle',self.sh_angle),('start',self.sh_start),('scale',self.sh_scale_sl),
-                               ('limit',self.sh_limit),('height',self.sh_scaleh),('const',self.sh_const),('exact',self.sh_exact)]:
+                               ('limit',self.sh_limit),('height',self.sh_scaleh),('const',self.sh_const),('exact',self.sh_exact),
+                               ('delta',self.sh_delta),('direction',self.sh_direction),('detail_radius',self.sh_detail_radius)]:
                 if key in form: widget.setValue(form[key])
             mode=form.get('height_mode','free')
             {'exact':self.sh_r_exact,'free':self.sh_r_free,'limit':self.sh_r_limit,'scale':self.sh_r_scale,'const':self.sh_r_const}.get(mode,self.sh_r_free).setChecked(True)
             for (_,key),b in zip(self.SH_MODES,self.sh_mode_btns): b.setChecked(key==form.get('combine','add'))
+            self.sh_preserve.setChecked(form.get('preserve',False))
+        if bind:
+            self.update_photo_view()
 
     def _settings(self):
         return dict(super()._settings(),workspace=self._parameters(),export_options=self._export_options())
@@ -824,6 +880,27 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
                                 ('Высота рельефа',self.sp_depth),('Шаг сетки',self.sp_step)]:
             widget = self._spin(original.value(), original.minimum(), original.maximum(), 6)
             fields.append(widget); form.addRow(label + ' (мм)', widget)
+        self.dimensions_resize_mode=core.QComboBox()
+        self.dimensions_resize_mode.addItem('Масштабировать существующую геометрию по X/Y','scale')
+        self.dimensions_resize_mode.addItem('Изменить только рабочую область — сохранить размеры геометрии','workspace')
+        if not new_project and self.has_content():
+            form.addRow('Действие',self.dimensions_resize_mode)
+        else:
+            self.dimensions_resize_mode.hide()
+        self.dimensions_grid_info=QLabel(); self.dimensions_grid_info.setWordWrap(True)
+        layout.addWidget(self.dimensions_grid_info)
+        def grid_info():
+            width,height,base,depth,step=[field.value() for field in fields]
+            nx,ny,used=core.grid_from_step(width,height,step)
+            mib=nx*ny*8/1024**2
+            self.dimensions_grid_info.setText(f'Разрешение: {nx} × {ny} ({nx*ny:,} точек).\n'
+                f'Фактический шаг: {width/(nx-1):.4g} × {height/(ny-1):.4g} мм.\n'
+                f'Один массив высот: {mib:.1f} МиБ; расчёт с временными массивами ≈ {mib*6:.1f} МиБ.\n'
+                'История и 3D используют дополнительную память. Предел сетки — 8 млн точек.'+
+                ('\nДля соблюдения предела фактический шаг увеличен.' if used>step*1.001 else ''))
+        for field in fields:
+            field.valueChanged.connect(grid_info)
+        grid_info()
         if self.stl_mesh is not None and not new_project:
             fields[2].setEnabled(False)
             fields[2].setToolTip('Для произвольной сетки толщина основания не определяется одним числом. Используйте Mesh Edit.')
@@ -842,19 +919,22 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
             self._clear_all(); self.project_path = None
             self.setWindowTitle(core.APP)
             self.sw_reset(); self._v_key = None
-        changed = self.apply_model_dimensions(*values, confirm=not new_project)
+        changed = self.apply_model_dimensions(*values, confirm=not new_project,
+                                               resize_mode=self.dimensions_resize_mode.currentData() if not new_project else 'scale')
         if new_project:
             self.update_lock(); self.rebuild_canvas(force=True)
             self._saved_sig = self.state_sig()
         return changed
 
-    def apply_model_dimensions(self, width, height, base, depth, step, confirm=True):
+    def apply_model_dimensions(self, width, height, base, depth, step, confirm=True, resize_mode='scale'):
         """Resize the existing composition; preserve Z detail and history in mm."""
         widgets = (self.sp_w,self.sp_h,self.sp_base,self.sp_depth,self.sp_step)
         values = tuple(float(v) for v in (width,height,base,depth,step))
         if any(not math.isfinite(v) or not w.minimum() <= v <= w.maximum() for w,v in zip(widgets,values)):
             raise ValueError('Размеры вне допустимых пределов. Проверьте значения в мм.')
         old = tuple(w.value() for w in widgets)
+        if resize_mode not in ('scale','workspace'):
+            raise ValueError('Неизвестный способ изменения размеров.')
         if values == old:
             return True
         if self.stl_mesh is not None and base != old[2]:
@@ -862,8 +942,9 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         if confirm and self.has_content():
             answer = QMessageBox.question(self, 'Изменение размеров модели',
                 f'Размер X/Y: {old[0]:g} × {old[1]:g} → {width:g} × {height:g} мм.\n'
-                f'Основание: {old[2]:g} → {base:g} мм; шаг: {old[4]:g} → {step:g} мм.\n'
-                'Композиция будет масштабирована по X/Y; высоты рельефа сохранятся. '
+                f'Основание: {old[2]:g} → {base:g} мм; шаг: {old[4]:g} → {step:g} мм.\n'+
+                ('Композиция будет масштабирована по X/Y; высоты рельефа сохранятся. ' if resize_mode=='scale' else
+                 'Размеры геометрии в мм сохранятся, начало координат — левый нижний угол. При уменьшении области часть карты высот будет обрезана. Сетка Mesh Edit не обрезается. ')+
                 'При изменении шага сетка пересчитывается, возможна потеря мелких деталей.\nПродолжить? Ctrl+Z отменит операцию.',
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if answer != QMessageBox.Yes:
@@ -875,32 +956,46 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         if new_z is not None:
             if (width,height,step) != (old[0],old[1],old[4]):
                 from scipy.ndimage import zoom
+                from relief_editing import resample_world_grid
                 nx,ny,used = core.grid_from_step(width,height,step)
-                new_z = zoom(new_z, (ny/new_z.shape[0],nx/new_z.shape[1]), order=1, prefilter=False)
+                if resize_mode=='scale':
+                    new_z = zoom(new_z, (ny/new_z.shape[0],nx/new_z.shape[1]), order=1, prefilter=False)
+                else:
+                    new_z = resample_world_grid(new_z,(0,0,old[0],old[1]),(0,0,width,height),(ny,nx),fill=old[2])
             new_z = new_z + base-old[2]
             if float(new_z.min()) < .05:
                 QMessageBox.warning(self,'Толщина основания','Изменение создаёт Z ниже 0,05 мм. Увеличьте основание; исходная модель сохранена.')
                 return False
         new_mesh = self.stl_mesh
-        if new_mesh is not None:
+        if new_mesh is not None and resize_mode=='scale':
             new_mesh = new_mesh.copy()
             vertices = np.array(new_mesh.vertices, dtype=float, copy=True)
             origin = vertices[:,:2].min(axis=0)
             vertices[:,:2] = origin + (vertices[:,:2]-origin)*[width/old[0],height/old[1]]
             new_mesh.vertices = vertices
         old_canvas = (self.canvas_w,self.canvas_h)
+        old_K = self.K
+        if self.photo_pil is not None:
+            frame=self.photo_frame or [0,0,old[0],old[1]]
+            self.photo_frame=([frame[0]*width/old[0],frame[1]*height/old[1],frame[2]*width/old[0],frame[3]*height/old[1]]
+                              if resize_mode=='scale' else list(frame))
         for widget,value in zip(widgets,values):
             widget.blockSignals(True); widget.setValue(value); widget.blockSignals(False)
         self._base_prev = base
         self.z, self.stl_mesh = new_z,new_mesh
         self.rebuild_canvas(force=True)
         fx,fy = self.canvas_w/old_canvas[0],self.canvas_h/old_canvas[1]
+        dy=0
+        if resize_mode=='workspace':
+            fx=fy=self.K/old_K; dy=(height-old[1])*self.K
         for vector in self.view.vectors():
-            vector.data.transform(lambda x,y:(x*fx,y*fy)); vector.refresh()
+            vector.data.transform(lambda x,y:(x*fx,y*fy+dy)); vector.refresh()
         for point in self.view.ctrl_points():
-            point.setPos(point.pos().x()*fx,point.pos().y()*fy)
+            point.setPos(point.pos().x()*fx,point.pos().y()*fy+dy)
         for point in self._irm_controls:
-            point['x'] *= width/old[0]; point['y'] *= height/old[1]; point['z'] += base-old[2]
+            if resize_mode=='scale':
+                point['x'] *= width/old[0]; point['y'] *= height/old[1]
+            point['z'] += base-old[2]
         self.push_history('Размеры модели (мм)',snap)
         self.sw_refresh(); self.show_mesh(reset=True)
         self.after_change(); self.update_rulers(); self._irm_refresh_list()

@@ -51,7 +51,9 @@ def mode_button(w, mode):
 
 def click_form_button(w, text, app):
     button = next(b for b in w.relief_dialog.findChildren(QPushButton) if b.text()==text)
-    w.relief_dialog.findChild(QScrollArea).ensureWidgetVisible(button)
+    scroll=w.relief_dialog.findChild(QScrollArea)
+    if scroll.isAncestorOf(button):
+        scroll.ensureWidgetVisible(button)
     app.processEvents()
     QTest.mouseClick(button, Qt.LeftButton)
     app.processEvents()
@@ -99,7 +101,9 @@ def test_f12_modes_apply_preview_and_undo(window, mode):
     w.sh_exact.setValue(2); mode_button(w,mode).setChecked(True)
     shape=core.build_shape(cov,*w.cell(),'round',45,'exact',2)
     if mode=='zero_out':
-        expected=core.combine_relief(before,np.zeros_like(before),1-cov,base,'zero')
+        expected=np.where(cov<=.5,base,before)
+    elif mode=='zero_in':
+        expected=np.where(cov>.5,base,before)
     else:
         expected=core.combine_relief(before,np.zeros_like(before) if mode=='zero_in' else shape,
                                      cov,base,'zero' if mode=='zero_in' else mode)

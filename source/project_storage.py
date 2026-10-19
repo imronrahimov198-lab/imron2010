@@ -89,6 +89,11 @@ def validate_project_payload(meta, arrays):
         if not isinstance(workspace.get(name, {}), dict):
             raise ValueError('Повреждены параметры инструмента: ' + name)
     sweep, form = workspace.get('sweep', {}), workspace.get('form', {})
+    frame=workspace.get('photo_frame')
+    if frame is not None:
+        _project_point(frame,4,'положение фото')
+        if frame[2]<=0 or frame[3]<=0:
+            raise ValueError('Размеры положения фото должны быть положительными.')
     rails, sections = sweep.get('rails', [None, None]), sweep.get('sections', [])
     if (not isinstance(rails, list) or len(rails) != 2 or not isinstance(sections, list)
             or any(x is not None and not isinstance(x, str) for x in rails)
@@ -109,7 +114,10 @@ def validate_project_payload(meta, arrays):
     if sweep.get('mode', 'add') not in ('add', 'sub', 'high', 'low'):
         raise ValueError('Неизвестный режим объединения сечений.')
     form_ranges = dict(angle=(-90,90), scale=(1,50), kind=(0,2), start=(-500,500),
-                       limit=(0,500), height=(0,500), exact=(0,500), const=(-500,500))
+                       limit=(0,500), height=(0,500), exact=(0,500), const=(-500,500),
+                       delta=(0,500),direction=(-180,180),detail_radius=(.1,100))
+    if 'preserve' in form and not isinstance(form['preserve'],bool):
+        raise ValueError('Некорректен режим сохранения деталей F12.')
     for key, bounds in form_ranges.items():
         if key in form:
             _project_number(form[key], key, *bounds, integer=key in ('angle', 'scale', 'kind'))
@@ -117,7 +125,8 @@ def validate_project_payload(meta, arrays):
         raise ValueError('Неизвестная форма F12.')
     if form.get('height_mode', 'free') not in ('free', 'limit', 'scale', 'const', 'exact'):
         raise ValueError('Неизвестный режим высоты F12.')
-    if form.get('combine', 'add') not in ('add', 'sub', 'high', 'low', 'zero_in', 'zero_out', 'replace'):
+    if form.get('combine', 'add') not in ('add', 'sub', 'high', 'low', 'zero_in', 'zero_out', 'replace',
+                                       'raise','lower','tilt','convex','concave'):
         raise ValueError('Неизвестный режим объединения F12.')
     if set(arrays) - {'z', 'mesh_vertices', 'mesh_faces'}:
         raise ValueError('Неизвестные данные геометрии проекта.')

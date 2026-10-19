@@ -3,7 +3,7 @@ import ast
 from pathlib import Path
 
 
-MODULES = ('input_limits', 'vector_import', 'relief_geometry', 'studio_icons', 'stl_export', 'interactive_geometry', 'project_storage', 'studio_core', 'interactive_tools', 'stone_relief_studio')
+MODULES = ('input_limits', 'vector_import', 'relief_geometry', 'relief_editing', 'studio_icons', 'stl_export', 'interactive_geometry', 'project_storage', 'studio_core', 'interactive_tools', 'stone_relief_studio')
 
 
 class FlattenStudio(ast.NodeTransformer):
@@ -30,7 +30,7 @@ def build(output):
     root = Path(__file__).resolve().parent
     header = '''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Stone Relief Studio — редактор векторов и рельефов, версия 3.3.1.
+"""Stone Relief Studio — редактор векторов и рельефов, версия 3.4.0 (этап P0).
 
 Вся программа находится в этом файле. Другие файлы исходного кода не нужны.
 Запуск: python stone_relief_studio_fixed.py
@@ -38,8 +38,11 @@ def build(output):
 python -m pip install PySide6 numpy Pillow scipy trimesh pyvista pyvistaqt qtpy ezdxf rtree svgelements shapely "vtk>=9.5,<9.6"
 
 Рабочий этап Pro 3.3: аудит, Interactive Relief Manipulation и Mesh Edit.
-Исправления 3.3.1: размеры модели с сохранением рельефа, направляющие
-одним щелчком, точная высота F12 в мм и отчёт реальных Z до/после.
+3.4.0: F12 редактирует готовый рельеф и фото; обнуление возвращает к основанию.
+Подъём/опускание на N мм сохраняют фактуру; наклон, выпуклость/вогнутость,
+сохранение деталей при замене, отчёт Z min/max, применение и отмена.
+Панель направляющих остаётся видимой. Размеры, сетка и оценка памяти;
+изменение рабочей области или масштабирование композиции с Undo/Redo.
 Точная высота не умножается на геометрический масштаб; 3D XYZ = 1:1.
 Существующие Studio, F12, две направляющие, векторы и «Лепка в 3D» сохранены.
 Контрольные точки: Z в мм, закрепление, Local/Full Surface, маска и края,
