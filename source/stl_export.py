@@ -144,7 +144,7 @@ def _atomic_stl(path, report, batches, progress=None):
     try:
         with tempfile.NamedTemporaryFile(prefix='.'+path.name+'.', suffix='.tmp', dir=path.parent, delete=False) as stream:
             temporary = FilePath(stream.name)
-            stream.write(b'Stone Relief Studio 3.3; millimetres'.ljust(80, b' '))
+            stream.write(b'Stone Relief Studio 3.3.1; millimetres'.ljust(80, b' '))
             stream.write(struct.pack('<I', report.triangles))
             written = 0
             for triangles in batches:

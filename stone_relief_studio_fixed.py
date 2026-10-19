@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Stone Relief Studio — редактор векторов и рельефов, версия 3.3.
+"""Stone Relief Studio — редактор векторов и рельефов, версия 3.3.1.
 
 Вся программа находится в этом файле. Другие файлы исходного кода не нужны.
 Запуск: python stone_relief_studio_fixed.py
@@ -8,6 +8,9 @@
 python -m pip install PySide6 numpy Pillow scipy trimesh pyvista pyvistaqt qtpy ezdxf rtree svgelements shapely "vtk>=9.5,<9.6"
 
 Рабочий этап Pro 3.3: аудит, Interactive Relief Manipulation и Mesh Edit.
+Исправления 3.3.1: размеры модели с сохранением рельефа, направляющие
+одним щелчком, точная высота F12 в мм и отчёт реальных Z до/после.
+Точная высота не умножается на геометрический масштаб; 3D XYZ = 1:1.
 Существующие Studio, F12, две направляющие, векторы и «Лепка в 3D» сохранены.
 Контрольные точки: Z в мм, закрепление, Local/Full Surface, маска и края,
 фоновый предпросмотр, применение одной операцией Undo/Redo.
@@ -480,7 +483,7 @@ def _atomic_stl(path, report, batches, progress=None):
     try:
         with tempfile.NamedTemporaryFile(prefix='.' + path.name + '.', suffix='.tmp', dir=path.parent, delete=False) as stream:
             temporary = FilePath(stream.name)
-            stream.write(b'Stone Relief Studio 3.3; millimetres'.ljust(80, b' '))
+            stream.write(b'Stone Relief Studio 3.3.1; millimetres'.ljust(80, b' '))
             stream.write(struct.pack('<I', report.triangles))
             written = 0
             for triangles in batches:
@@ -812,15 +815,15 @@ def validate_project_payload(meta, arrays):
             _project_number(sweep[key], key, -500, 500)
     if sweep.get('mode', 'add') not in ('add', 'sub', 'high', 'low'):
         raise ValueError('Неизвестный режим объединения сечений.')
-    form_ranges = dict(angle=(-90, 90), scale=(1, 50), kind=(0, 2), start=(-500, 500), limit=(0, 500), height=(0, 500), const=(-500, 500))
+    form_ranges = dict(angle=(-90, 90), scale=(1, 50), kind=(0, 2), start=(-500, 500), limit=(0, 500), height=(0, 500), exact=(0, 500), const=(-500, 500))
     for key, bounds in form_ranges.items():
         if key in form:
             _project_number(form[key], key, *bounds, integer=key in ('angle', 'scale', 'kind'))
     if form.get('kind', 0) not in (0, 1, 2):
         raise ValueError('Неизвестная форма F12.')
-    if form.get('height_mode', 'free') not in ('free', 'limit', 'scale', 'const'):
+    if form.get('height_mode', 'free') not in ('free', 'limit', 'scale', 'const', 'exact'):
         raise ValueError('Неизвестный режим высоты F12.')
-    if form.get('combine', 'add') not in ('add', 'sub', 'high', 'low', 'zero_in', 'zero_out'):
+    if form.get('combine', 'add') not in ('add', 'sub', 'high', 'low', 'zero_in', 'zero_out', 'replace'):
         raise ValueError('Неизвестный режим объединения F12.')
     if set(arrays) - {'z', 'mesh_vertices', 'mesh_faces'}:
         raise ValueError('Неизвестные данные геометрии проекта.')
@@ -1520,13 +1523,21 @@ def shape_profile(kind, angle, d, w, cap=None):
 
 def build_shape(cov, cell_x, cell_y, kind='round', angle=45.0, mode='free', value=1.0, start_h=0.0, scale=1.0):
     """Форма внутри области (как «Редактор формы» ArtCAM): мм над нулём рельефа.
-    mode: free (без ограничений) | limit (ограничить по высоте) | scale (масштаб по высоте) | const (постоянная)."""
+    mode: exact (точные мм, без множителя) | free (по углу и ширине) |
+    limit (предел мм) | scale (нормировать до мм) | const (постоянная мм).
+    Геометрический множитель используется только в режиме free."""
     inside = cov > 0.5
     if not inside.any():
         raise ValueError('Область слишком мала для текущей детализации.')
     d = distance_inside(inside) * 0.5 * (cell_x + cell_y)
     w = max(float(d.max()), 1e-09)
     h = shape_profile(kind, angle, d, w, cap=value if mode in ('limit', 'scale') else None)
+    if mode == 'exact':
+        if kind in ('angular', 'plateau'):
+            h = np.clip(h, -abs(float(value)), abs(float(value)))
+        peak = float(np.max(np.abs(h * cov)))
+        h = h * (abs(float(value)) / peak) if peak > 0 else np.zeros_like(h)
+        return np.where(cov > 0.001, start_h + h, 0.0)
     if mode == 'limit':
         h = np.clip(h, -abs(value), abs(value))
     elif mode == 'scale':
@@ -1535,7 +1546,7 @@ def build_shape(cov, cell_x, cell_y, kind='round', angle=45.0, mode='free', valu
             h = h * (abs(value) / mx)
     elif mode == 'const':
         h = np.full(d.shape, float(value))
-    return np.where(cov > 0.001, start_h + h * scale, 0.0)
+    return np.where(cov > 0.001, start_h + h * (scale if mode == 'free' else 1.0), 0.0)
 
 def resample_polyline(pts, n):
     pts = np.asarray(pts, float)
@@ -1888,7 +1899,7 @@ def demo_relief(n=160):
 from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QPolygonF, QShortcut
 from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsItem, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QInputDialog, QRadioButton, QButtonGroup, QProgressDialog, QTabWidget, QTextBrowser, QToolBar, QToolButton, QVBoxLayout, QWidget
-APP = 'Stone Relief Studio Pro'
+APP = 'Stone Relief Studio Pro 3.3.1'
 
 def glyph_icon(ch, size=30, color='#eeeeee'):
     pm = QPixmap(size, size)
@@ -1942,7 +1953,9 @@ class VectorItem(QGraphicsPathItem):
         self.prepareGeometryChange()
         self.setPath(build_qpath(self.data))
         sel = self.isSelected()
-        pen = QPen(QColor('#0a58ff') if sel else QColor('#000000'), 1.2 if sel else 1.0)
+        role = getattr(self, 'sweep_role', None)
+        colors = {'top': '#007cba', 'bottom': '#dc6231', 'section': '#8b42b5', 'z': '#20875e'}
+        pen = QPen(QColor(colors[role] if role in colors else '#0a58ff' if sel else '#000000'), 2.8 if role else 1.2 if sel else 1.0)
         pen.setCosmetic(True)
         self.setPen(pen)
         self.setBrush(QBrush(QColor(0, 0, 0, 18)) if sel and self.data.closed else QBrush(Qt.NoBrush))
@@ -2387,6 +2400,19 @@ class VectorView(QGraphicsView):
 
     def mousePressEvent(self, e):
         self._suppress_ctx = False
+        if e.button() == Qt.LeftButton and getattr(self.owner, '_sw_pending_pick', None):
+            pos = self.mapToScene(e.position().toPoint())
+            for hit in reversed(self.vectors()):
+                if hit.shape().contains(hit.mapFromScene(pos)):
+                    if hit.data.closed:
+                        self.owner.statusBar().showMessage('Нужен открытый вектор. Щёлкните направляющую или сечение; Esc — отмена.')
+                        return
+                    self.scene_obj.clearSelection()
+                    hit.setSelected(True)
+                    self.owner.sw_complete_pick()
+                    return
+            self.owner.statusBar().showMessage('Вектор не найден. Щёлкните линию или кривую; Esc — отмена.')
+            return
         if e.button() == Qt.MiddleButton:
             self._pan = e.position()
             self.setCursor(Qt.ClosedHandCursor)
@@ -3015,6 +3041,11 @@ class Studio(QMainWindow):
         self.statusBar().showMessage(TIPS[tool])
 
     def escape(self):
+        if getattr(self, '_sw_pending_pick', None):
+            self._sw_pending_pick = None
+            self.open_sweep_dialog()
+            self.statusBar().showMessage('Выбор отменён; предыдущие направляющие сохранены.')
+            return
         if self.view.mode == 'draw' and self.view.draw_nodes:
             self.view.cancel_draw()
         if self.view.mode != 'select':
@@ -3742,6 +3773,9 @@ class Studio(QMainWindow):
         self.statusBar().showMessage('Деформация применена. Ctrl+Z — отменить.')
 
     def cancel_preview(self, silent=False):
+        if hasattr(self, 'sh_timer'):
+            self.sh_timer.stop()
+        self.sh_preview_flag = False
         if not self.preview_active:
             return
         self.preview_active, self.preview_z, self.preview_mask = (False, None, None)
@@ -3770,7 +3804,7 @@ class Studio(QMainWindow):
                 self.import_dxf(p)
             elif ext == '.svg':
                 self.import_svg(p)
-    SH_MODES = [('Добавить', 'add'), ('Вычитание', 'sub'), ('Обнул. внутри', 'zero_in'), ('По наибольш.', 'high'), ('По наименьш.', 'low'), ('Обнул. снаружи', 'zero_out')]
+    SH_MODES = [('Добавить', 'add'), ('Вычитание', 'sub'), ('Обнул. внутри', 'zero_in'), ('По наибольш.', 'high'), ('По наименьш.', 'low'), ('Обнул. снаружи', 'zero_out'), ('Заменить', 'replace')]
 
     def open_relief_editor(self):
         if self.relief_dialog is None:
@@ -3825,18 +3859,21 @@ class Studio(QMainWindow):
         self.sh_scale_sl = QSlider(Qt.Vertical)
         self.sh_scale_sl.setRange(1, 50)
         self.sh_scale_sl.setValue(10)
-        self.sh_scale_sl.setToolTip('Масштаб высоты формы: 0.1 … 5.0')
+        self.sh_scale_sl.setToolTip('Множитель геометрии 0.1 … 5.0 только для режима «По углу и ширине». Это не масштаб 3D-вида.')
         top.addWidget(self.sh_scale_sl)
         box = QWidget()
         form = QFormLayout(box)
-        self.sh_r_free = QRadioButton('Без ограничений')
+        self.sh_r_exact = QRadioButton('Точная высота в мм')
+        self.sh_exact = self._spin(2, 0, 500, 4)
+        self.sh_r_free = QRadioButton('По углу и ширине (без предела высоты)')
         self.sh_r_limit = QRadioButton('Ограничить по высоте')
         self.sh_r_scale = QRadioButton('Масштаб по высоте')
         self.sh_r_const = QRadioButton('Постоянная высота (для векторов)')
-        self.sh_r_free.setChecked(True)
+        self.sh_r_exact.setChecked(True)
         self.sh_limit = self._spin(1, 0, 500, 2)
         self.sh_scaleh = self._spin(1, 0, 500, 2)
         self.sh_const = self._spin(0, -500, 500, 2)
+        form.addRow(self.sh_r_exact, self.sh_exact)
         form.addRow(self.sh_r_free)
         form.addRow(self.sh_r_limit, self.sh_limit)
         form.addRow(self.sh_r_scale, self.sh_scaleh)
@@ -3844,16 +3881,24 @@ class Studio(QMainWindow):
         root.addWidget(box)
         self.sh_modegrp = QButtonGroup(d)
         self.sh_mode_btns = []
-        for r in range(2):
+        self.sh_mode_label = QLabel()
+        root.addWidget(self.sh_mode_label)
+        for r in range((len(self.SH_MODES) + 2) // 3):
             row = QHBoxLayout()
             for name, key in self.SH_MODES[r * 3:(r + 1) * 3]:
                 b = QPushButton(name)
                 b.setCheckable(True)
                 b.setChecked(key == 'add')
+                b.setToolTip('Выбрать операцию; для изменения геометрии нажмите «Применить».')
+                b.setStyleSheet('QPushButton:checked { background:#286c5d; color:white; border:2px solid #123f35; font-weight:bold; }')
                 self.sh_modegrp.addButton(b)
                 self.sh_mode_btns.append(b)
                 row.addWidget(b)
             root.addLayout(row)
+        self.sh_report = QLabel('Z в мм: дно плиты = 0; ноль рельефа = верх основания. 3D: масштаб XYZ 1:1.')
+        self.sh_report.setWordWrap(True)
+        self.sh_report.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(self.sh_report)
         row = QHBoxLayout()
         for text, slot in [('Применить', lambda: self.shape_apply()), ('Предпросмотр', lambda: self.shape_apply(True)), ('Сброс', self.sh_reset), ('Закрыть', d.hide)]:
             b = QPushButton(text)
@@ -3867,9 +3912,9 @@ class Studio(QMainWindow):
         self.sh_angle_sl.valueChanged.connect(self.sh_angle.setValue)
         self.sh_angle.valueChanged.connect(self.sh_update)
         self.sh_scale_sl.valueChanged.connect(self.sh_update)
-        for w in (self.sh_start, self.sh_limit, self.sh_scaleh, self.sh_const):
+        for w in (self.sh_start, self.sh_limit, self.sh_scaleh, self.sh_const, self.sh_exact):
             w.valueChanged.connect(self.sh_update)
-        for w in (self.sh_r_free, self.sh_r_limit, self.sh_r_scale, self.sh_r_const) + tuple(self.sh_mode_btns):
+        for w in (self.sh_r_exact, self.sh_r_free, self.sh_r_limit, self.sh_r_scale, self.sh_r_const) + tuple(self.sh_mode_btns):
             w.toggled.connect(self.sh_update)
         self.sh_set_kind(0)
         return d
@@ -3881,7 +3926,12 @@ class Studio(QMainWindow):
         self.sh_update()
 
     def sh_update(self, *_):
-        self.sh_scale_lb.setText(f'Масштаб ×{self.sh_scale_sl.value() / 10.0:.1f}')
+        exact = self.sh_r_exact.isChecked()
+        free = self.sh_r_free.isChecked()
+        self.sh_scale_sl.setEnabled(free)
+        self.sh_exact.setEnabled(exact)
+        self.sh_scale_lb.setText(f'Масштаб геометрии ×{self.sh_scale_sl.value() / 10.0:.1f}' if free else 'Высота в мм: масштаб ×1')
+        self.sh_mode_label.setText('Операция: ' + dict(((k, n) for n, k in self.SH_MODES))[self.sh_mode_key()] + ' → Применить')
         self.sh_view.set_params(self.sh_kind, self.sh_angle.value())
         if self.sh_preview_flag and self.preview_active:
             self.sh_timer.start(250)
@@ -3891,7 +3941,8 @@ class Studio(QMainWindow):
         self.sh_angle.setValue(45)
         self.sh_start.setValue(0)
         self.sh_scale_sl.setValue(10)
-        self.sh_r_free.setChecked(True)
+        self.sh_r_exact.setChecked(True)
+        self.sh_exact.setValue(2)
         self.sh_limit.setValue(1)
         self.sh_scaleh.setValue(1)
         self.sh_const.setValue(0)
@@ -3906,6 +3957,8 @@ class Studio(QMainWindow):
         return 'add'
 
     def sh_height_mode(self):
+        if self.sh_r_exact.isChecked():
+            return ('exact', self.sh_exact.value())
         if self.sh_r_limit.isChecked():
             return ('limit', self.sh_limit.value())
         if self.sh_r_scale.isChecked():
@@ -3923,6 +3976,8 @@ class Studio(QMainWindow):
 
     @busy
     def shape_apply(self, preview=False):
+        if not preview:
+            self.sh_timer.stop()
         try:
             self._need_z()
             mode = self.sh_mode_key()
@@ -3940,6 +3995,10 @@ class Studio(QMainWindow):
             else:
                 if self.sh_source.currentIndex() == 1:
                     shape = self.photo_shape()
+                    if self.sh_r_exact.isChecked():
+                        peak = float(np.max(shape * cov))
+                        shape = shape * (self.sh_exact.value() / peak) if peak > 0 else np.zeros_like(shape)
+                        shape = np.where(cov > 0.001, self.sh_start.value() + shape, 0.0)
                 else:
                     hm, val = self.sh_height_mode()
                     shape = build_shape(cov, cx, cy, ['round', 'angular', 'plateau'][self.sh_kind], self.sh_angle.value(), hm, val, self.sh_start.value(), self.sh_scale_sl.value() / 10.0)
@@ -3948,6 +4007,20 @@ class Studio(QMainWindow):
         except ValueError as e:
             QMessageBox.information(self, 'Редактор формы', str(e))
             return
+        before_z, after_z = (float(self.z.max()), float(newz.max()))
+        delta = float(np.max(np.abs(newz - self.z)))
+        shape_peak = float(np.max(shape * cov)) if mode not in ('zero_in', 'zero_out') else 0.0
+        shape_min = float(np.min(shape * cov)) if mode not in ('zero_in', 'zero_out') else 0.0
+        self.sh_last_report = dict(before_z=before_z, after_z=after_z, shape_height=shape_peak, shape_min=shape_min, max_change=delta, relief_height=after_z - base)
+        report = f'Форма относительно верха основания: {shape_min:.4f} … {shape_peak:.4f} мм; основание: {base:.4f} мм.\nРеальный Z max: {before_z:.4f} → {after_z:.4f} мм; итог над основанием: {after_z - base:.4f} мм.\nМаксимальное изменение: {delta:.4f} мм. 3D XYZ 1:1.'
+        exceeds = mode == 'add' and after_z - base > self.sp_depth.value() + 1e-07
+        if exceeds:
+            report += f'\nВНИМАНИЕ: итог превышает заданную высоту рельефа {self.sp_depth.value():.4f} мм.'
+        self.sh_report.setText(report)
+        if exceeds and (not preview):
+            answer = QMessageBox.question(self, 'Превышение высоты рельефа', report + '\nПрименить сложение?', QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
         if preview:
             self.preview_z, self.preview_mask, self.preview_active = (newz, weight > 0.001, True)
             self.sh_preview_flag = True
@@ -3961,7 +4034,7 @@ class Studio(QMainWindow):
         self.z = newz
         self.show_mesh()
         self.after_change()
-        self.statusBar().showMessage(label + ' — выполнено. Ctrl+Z — отменить.')
+        self.statusBar().showMessage(label + f' — Z max {before_z:.4f} → {after_z:.4f} мм. Ctrl+Z — отменить.')
 
     def create_dome(self):
         self.open_relief_editor()
@@ -4089,9 +4162,9 @@ class Studio(QMainWindow):
         self.scene.clearSelection()
         self.sweep_dialog.hide()
         self.tabs.setCurrentIndex(0)
-        self.view.set_mode('select')
+        self.set_tool('select')
         self.view.setFocus()
-        self.statusBar().showMessage('Выделите ОТКРЫТЫЙ вектор мышью, затем нажмите Enter. Esc — отмена выбора.')
+        self.statusBar().showMessage('Щёлкните ОТКРЫТЫЙ вектор: он назначится автоматически. Esc — отмена выбора.')
 
     def sw_complete_pick(self):
         which = getattr(self, '_sw_pending_pick', None)
@@ -4115,6 +4188,10 @@ class Studio(QMainWindow):
 
     def sw_pick(self, which):
         sel = self.sw_open_selected()
+        index = 0 if which == 'top' else 1
+        if which in ('top', 'bottom') and len(sel) == 1 and (sel[0] is self.sw_rails[1 - index]):
+            self.statusBar().showMessage('Выберите два разных вектора. Предыдущие направляющие сохранены.')
+            return
         if which == 'top':
             if len(sel) >= 2:
                 self.sw_rails = [sel[0], sel[1]]
@@ -4191,6 +4268,9 @@ class Studio(QMainWindow):
                 self.sw_rails[i] = None
         if not self._alive(self.sw_zb):
             self.sw_zb = None
+        for vector in self.view.vectors():
+            vector.sweep_role = 'top' if vector is self.sw_rails[0] else 'bottom' if vector is self.sw_rails[1] else 'section' if vector in self.sw_sections else 'z' if vector is self.sw_zb else None
+            vector.refresh()
         red = lambda t: f'<span style="color:#e03030">{t}</span>'
         ok = lambda t: f'<b>{t}</b>'
         n = '—'
@@ -4198,7 +4278,7 @@ class Studio(QMainWindow):
             lens = [_polylen(np.array(v.scene_points(), float)) / self.K for v in self.sw_rails]
             n = str(int(np.clip(max(lens), 200, 600)))
         zt = 'Не используется' if not self.sw_use_z.isChecked() else ok('Выбрано') if self.sw_zb else red('Не выбрано')
-        self.sw_state.setText(f"Первая: {(ok('Выбрано') if self.sw_rails[0] else red('Не выбрано'))}<br>Вторая: {(ok('Выбрано') if self.sw_rails[1] else red('Не выбрано'))}<br>Граница по Z: {zt}<br>Сечение: {(ok(str(len(self.sw_sections))) if self.sw_sections else red('Не выбрано'))}<br>Отрезков: {n}")
+        self.sw_state.setText(f"""<span style="color:#007cba">Первая (синяя)</span>: {(ok('Выбрано') if self.sw_rails[0] else red('Не выбрано'))}<br><span style="color:#dc6231">Вторая (оранжевая)</span>: {(ok('Выбрано') if self.sw_rails[1] else red('Не выбрано'))}<br>Граница по Z: {zt}<br><span style="color:#8b42b5">Сечения (фиолетовые)</span>: {(ok(str(len(self.sw_sections))) if self.sw_sections else red('Не выбрано'))}<br>Отрезков: {n}""")
         self.sw_list.clear()
         k = len(self.sw_sections)
         for i in range(k):
@@ -4878,7 +4958,7 @@ def build_book_images(folder):
     save('interactive', [(base, 'До: исходная резьба'), (_big(hillshade(changed, 45, 40)), 'После: поднятая область с неподвижным краем')])
     save('mesh_edit', [(_card(['STL: вершины + грани', 'Выбор: ЛКМ / Shift+ЛКМ', 'Синие точки закреплены']), 'Исходная сетка'), (_card(['X/Y/Z — смещение в мм', 'Предпросмотр → Применить', 'Ctrl+Z — вернуть оригинал']), 'Порядок работы')])
     return out
-BOOK = [('interactive', 'Interactive Relief Manipulation', 'Плавный изгиб области контрольными точками без размытия мелкой резьбы.', ['Создайте рельеф и выделите замкнутый контур области в 2D (без контура используется вся плита).', 'Нажмите «Контроль рельефа / Mesh Edit», выберите режим «Рельеф» и включите «Выбирать и тянуть в 3D».', 'Щелчок на поверхности добавляет точку. Тяните существующую точку вверх/вниз или введите её Z в мм.', 'Local действует в радиусе; Full Surface плавно меняет всю область. Фиксация края оставляет внешний ряд точек неподвижным.', 'Кнопка «Закрепить / снять» удерживает высоту выбранной точки. Синяя точка закреплена, золотая свободна.', 'Проверьте предпросмотр и нажмите «Применить». Ctrl+Z отменяет всю применённую деформацию.', 'Не применённый предпросмотр в проект не записывается; контрольные точки сохраняются.'], ['ЛКМ — добавить / выбрать точку', 'Тянуть по вертикали — изменить Z', 'Для вращения выключите выбор и перетаскивание', 'Ctrl+Z / Ctrl+Y — Undo / Redo'], 'На лепестке закрепите основание, поднимите точки верхней части и включите Full Surface с фиксированным краем.'), ('mesh_edit', 'Mesh Edit · исходная сетка X/Y/Z', 'Редактировать STL с нависающими деталями без преобразования в карту высот.', ['Откройте «Контроль рельефа / Mesh Edit» и нажмите «STL как сетка». Единицы файла трактуются как мм.', 'Выберите режим Mesh Edit и вид выделения: вершины, рёбра или грани.', 'Включите выбор мышью. Shift добавляет вершины к выделению; закреплённые вершины не перемещаются.', 'Задайте смещения X/Y/Z в мм, силу и радиус мягкого выделения либо тяните по выбранной оси.', 'Выполните предпросмотр и примените результат. Исходная сетка хранится в истории Undo.', 'После изменения проверяйте STL: перемещение может вызвать самопересечения, которые этот этап полностью не проверяет.', 'Кнопка «Рельеф → сетка» создаёт сетку полного разрешения; Undo возвращает карту высот.'], ['ЛКМ — вершина / ребро / грань', 'Shift+ЛКМ — добавить к выбору', 'Смещения X/Y/Z — в мм', 'Ctrl+Z — вернуть исходную геометрию'], 'Подвиньте край листа по X и Z. Существующие нависающие элементы и треугольные грани сохраняются.'), ('draw', 'Рисование вектора', 'Обвести лепесток, лист или орнамент тонкой чёрной линией (прямые и кривые Безье).', ['Кнопка «✎» слева.', 'ЛКМ — поставить точку. Две точки — прямая.', 'Нажать и потянуть — получится гладкий узел с кривой.', 'ПКМ — закончить открытый вектор (он сохранится). Щелчок по первой точке — замкнуть.', 'После завершения программа переходит в режим выделения; Esc отменяет незаконченное.'], ['ЛКМ — точка (тянуть — кривая)', 'ПКМ — закончить открытый', 'Esc — отмена', 'Колесо — масштаб, средняя кнопка — перемещение холста'], 'Обведите лепесток замкнутым вектором — он станет областью деформации.'), ('nodes', 'Узлы и ручки Безье', 'Точная правка формы вектора.', ['Выделите вектор щелчком по линии (Shift или рамка — несколько).', 'Тяните квадратики-узлы и синие ручки.', 'Двойной щелчок по узлу — гладкий/острый.', 'ПКМ по линии — «Добавить узел здесь», по узлу — «Удалить узел».'], ['ЛКМ — тянуть узел/ручку', 'Alt при тяге ручки — независимо от второй', 'ПКМ — меню', 'Delete — удалить'], 'Подгоните контур по краю лепестка, добавляя узлы в изгибах.'), ('segment', 'Удалить участок', 'Убрать часть линии между двумя соседними точками; остальное остаётся независимыми векторами.', ['ПКМ прямо на нужном сегменте.', 'Выберите «Удалить участок».'], ['ПКМ по сегменту — контекстное меню'], 'Замкнутый контур станет открытой линией, открытый — разделится на две части.'), ('fade', 'Осветление фото до белого фона', 'Плавно превратить подложку в белую, не трогая векторы и рельеф.', ['Ползунок над 2D-окном.', '0 — фото, 100 — белый фон.'], ['Только ползунок'], 'Осветлите на 65% и рисуйте мелкие детали, чёрные линии останутся видны.'), ('deform', 'Деформация поверхности', 'Управлять формой всей области: плавный изгиб, волна, вершина, между направляющими, по управляющим точкам.', ['Выделите замкнутый вектор — это область.', 'Выберите вид; задайте высоты сторон/точек; нарисуйте сечение (форму перехода).', '«Закрепить границы» оставляет край; поле «Слияние» — как форма объединяется с рельефом.', 'Для «Между направляющими» выделите два открытых вектора; для точек — поставьте «◉».', 'Перейдите в «Редактирование 3D», нажмите «Предпросмотр», затем «Применить» или «Отмена».'], ['Ctrl+Z / Ctrl+Y — отмена и повтор', 'Остальная поверхность затемняется в предпросмотре'], 'Рисунки справа получены тем же алгоритмом, что и в программе, на учебном лепестке.'), ('editor', 'Редактор формы (F12)', 'Создать форму внутри выделенных замкнутых векторов (округлая, угловая, плато) и объединить её с рельефом; обнулить рельеф внутри или снаружи векторов.', ['Выделите замкнутые векторы и нажмите F12 (Рельефы → Редактор формы).', 'Выберите форму: округлая, угловая или плато; задайте угол (отрицательный — выемка) и начальную высоту.', 'Высота: без ограничений, ограничить по высоте, масштаб по высоте или постоянная высота.', 'Выберите действие: Добавить, Вычитание, По наибольш., По наименьш., Обнул. внутри, Обнул. снаружи.', '«Предпросмотр» показывает результат, «Применить» меняет рельеф, «Сброс» возвращает настройки.'], ['F12 — открыть окно', 'Ctrl+Z — отмена'], 'Округлый лепесток: угол 45°, «Масштаб по высоте» 0,8 мм, действие «Добавить».'), ('sweep', 'Вытягивание по двум направляющим', 'Создать рельеф вытягиванием одного или нескольких сечений вдоль двух направляющих; результат объединяется с рельефом.', ['Нарисуйте открытые векторы: верхнюю и нижнюю направляющие и одно или несколько сечений.', 'Выделите все векторы и нажмите «Верхняя направляющая — Выбор»: первый — верхняя, второй — нижняя, остальные — сечения.', 'Или выбирайте по одному: «Нижняя направляющая», «Граница по Z» (кнопки «Выбор»), «Добавить сечение».', '«Развернуть направляющие» меняет направление, «Переход между сечениями» плавно смешивает сечения.', '«Масштабировать высоту по ширине», «Начальная высота» и «Масштабировать конечную высоту» задают высоту.', 'Выберите «Объединить» (добавить, вычесть, по наибольшему, по наименьшему) и нажмите «Вычислить».'], ['Рельефы → Вытягиваемые профили', 'Сечение идёт от первой точки вектора к последней, вверх — выше'], 'Одно сечение-арка даёт валик вдоль траектории; два сечения с переходом — валик, плавно меняющий форму.'), ('transform', 'Перемещение готового рельефа', 'Сдвинуть, повернуть, масштабировать, копировать, отразить выбранную часть рельефа.', ['Выделите замкнутый вектор.', 'Задайте сдвиг в мм, угол, масштаб.', '«Переместить» или «Копировать в новое место»; «Отразить» — по горизонтали или вертикали.', 'Флажок «вместе со связанными векторами» переносит и контуры.'], ['Ctrl+Z — отмена'], 'Скопируйте лепесток на другое место модели.'), ('contour', 'Векторы по высоте', 'Создать контур по границе заданного уровня рельефа.', ['Вкладка «Контуры по высоте».', 'Задайте уровень в мм (например 7 при высоте 10).', '«Построить контуры» — появятся обычные редактируемые векторы.'], ['—'], 'Уровень 7 мм при высоте 10 мм даёт линию по верхней части.'), ('light', 'Освещение и материалы', 'Менять вид модели светом; STL при этом не меняется.', ['Вкладка «Свет 3D»: материал, яркость, контраст.', 'Солнце: поворот и высота, значок, выключение.', 'Дополнительный свет можно отключить; «Тени» включает тени (медленнее).'], ['ЛКМ — вращать', 'Колесо — масштаб', 'Shift+ЛКМ — сдвиг'], 'Проверяйте рельеф при низком боковом свете — так его увидят на камне.'), ('files', 'Файлы, история и экспорт', 'Сохранение проекта, импорт DXF/SVG, экспорт SVG и STL в мм.', ['Ctrl+S — сохранить проект (фото, векторы, размеры, настройки, геометрия).', 'Ctrl+O — открыть.', 'Файл → Импорт DXF / SVG; Экспорт SVG, Экспорт STL.', 'Толщину основания можно менять в любой момент.'], ['Ctrl+Z / Ctrl+Y', 'F1 — эта книга'], 'Перед экспортом STL смотрите «Замкнутая модель: да».')]
+BOOK = [('interactive', 'Interactive Relief Manipulation', 'Плавный изгиб области контрольными точками без размытия мелкой резьбы.', ['Создайте рельеф и выделите замкнутый контур области в 2D (без контура используется вся плита).', 'Нажмите «Контроль рельефа / Mesh Edit», выберите режим «Рельеф» и включите «Выбирать и тянуть в 3D».', 'Щелчок на поверхности добавляет точку. Тяните существующую точку вверх/вниз или введите её Z в мм.', 'Local действует в радиусе; Full Surface плавно меняет всю область. Фиксация края оставляет внешний ряд точек неподвижным.', 'Кнопка «Закрепить / снять» удерживает высоту выбранной точки. Синяя точка закреплена, золотая свободна.', 'Проверьте предпросмотр и нажмите «Применить». Ctrl+Z отменяет всю применённую деформацию.', 'Не применённый предпросмотр в проект не записывается; контрольные точки сохраняются.'], ['ЛКМ — добавить / выбрать точку', 'Тянуть по вертикали — изменить Z', 'Для вращения выключите выбор и перетаскивание', 'Ctrl+Z / Ctrl+Y — Undo / Redo'], 'На лепестке закрепите основание, поднимите точки верхней части и включите Full Surface с фиксированным краем.'), ('mesh_edit', 'Mesh Edit · исходная сетка X/Y/Z', 'Редактировать STL с нависающими деталями без преобразования в карту высот.', ['Откройте «Контроль рельефа / Mesh Edit» и нажмите «STL как сетка». Единицы файла трактуются как мм.', 'Выберите режим Mesh Edit и вид выделения: вершины, рёбра или грани.', 'Включите выбор мышью. Shift добавляет вершины к выделению; закреплённые вершины не перемещаются.', 'Задайте смещения X/Y/Z в мм, силу и радиус мягкого выделения либо тяните по выбранной оси.', 'Выполните предпросмотр и примените результат. Исходная сетка хранится в истории Undo.', 'После изменения проверяйте STL: перемещение может вызвать самопересечения, которые этот этап полностью не проверяет.', 'Кнопка «Рельеф → сетка» создаёт сетку полного разрешения; Undo возвращает карту высот.'], ['ЛКМ — вершина / ребро / грань', 'Shift+ЛКМ — добавить к выбору', 'Смещения X/Y/Z — в мм', 'Ctrl+Z — вернуть исходную геометрию'], 'Подвиньте край листа по X и Z. Существующие нависающие элементы и треугольные грани сохраняются.'), ('draw', 'Рисование вектора', 'Обвести лепесток, лист или орнамент тонкой чёрной линией (прямые и кривые Безье).', ['Кнопка «✎» слева.', 'ЛКМ — поставить точку. Две точки — прямая.', 'Нажать и потянуть — получится гладкий узел с кривой.', 'ПКМ — закончить открытый вектор (он сохранится). Щелчок по первой точке — замкнуть.', 'После завершения программа переходит в режим выделения; Esc отменяет незаконченное.'], ['ЛКМ — точка (тянуть — кривая)', 'ПКМ — закончить открытый', 'Esc — отмена', 'Колесо — масштаб, средняя кнопка — перемещение холста'], 'Обведите лепесток замкнутым вектором — он станет областью деформации.'), ('nodes', 'Узлы и ручки Безье', 'Точная правка формы вектора.', ['Выделите вектор щелчком по линии (Shift или рамка — несколько).', 'Тяните квадратики-узлы и синие ручки.', 'Двойной щелчок по узлу — гладкий/острый.', 'ПКМ по линии — «Добавить узел здесь», по узлу — «Удалить узел».'], ['ЛКМ — тянуть узел/ручку', 'Alt при тяге ручки — независимо от второй', 'ПКМ — меню', 'Delete — удалить'], 'Подгоните контур по краю лепестка, добавляя узлы в изгибах.'), ('segment', 'Удалить участок', 'Убрать часть линии между двумя соседними точками; остальное остаётся независимыми векторами.', ['ПКМ прямо на нужном сегменте.', 'Выберите «Удалить участок».'], ['ПКМ по сегменту — контекстное меню'], 'Замкнутый контур станет открытой линией, открытый — разделится на две части.'), ('fade', 'Осветление фото до белого фона', 'Плавно превратить подложку в белую, не трогая векторы и рельеф.', ['Ползунок над 2D-окном.', '0 — фото, 100 — белый фон.'], ['Только ползунок'], 'Осветлите на 65% и рисуйте мелкие детали, чёрные линии останутся видны.'), ('deform', 'Деформация поверхности', 'Управлять формой всей области: плавный изгиб, волна, вершина, между направляющими, по управляющим точкам.', ['Выделите замкнутый вектор — это область.', 'Выберите вид; задайте высоты сторон/точек; нарисуйте сечение (форму перехода).', '«Закрепить границы» оставляет край; поле «Слияние» — как форма объединяется с рельефом.', 'Для «Между направляющими» выделите два открытых вектора; для точек — поставьте «◉».', 'Перейдите в «Редактирование 3D», нажмите «Предпросмотр», затем «Применить» или «Отмена».'], ['Ctrl+Z / Ctrl+Y — отмена и повтор', 'Остальная поверхность затемняется в предпросмотре'], 'Рисунки справа получены тем же алгоритмом, что и в программе, на учебном лепестке.'), ('editor', 'Редактор формы (F12)', 'Создать форму внутри выделенных замкнутых векторов (округлая, угловая, плато) и объединить её с рельефом; обнулить рельеф внутри или снаружи векторов.', ['Выделите замкнутые векторы и нажмите F12 (Рельефы → Редактор формы).', 'Выберите форму: округлая, угловая или плато; задайте угол (отрицательный — выемка) и начальную высоту.', 'Для размеров ЧПУ выберите «Точная высота в мм»: 2 мм при основании 5 мм дают Z=7 мм; 7 мм дают Z=12 мм на плите.', 'Угол меняет профиль. Множитель действует только в режиме «По углу и ширине»; в этом режиме высота может быть большой.', 'Выберите операцию (зелёная кнопка): Добавить, Вычитание, По наибольш., По наименьш., Заменить, Обнул. внутри или снаружи.', '«Добавить» выбирает сложение, «Применить» выполняет его. Смотрите Z до/после в мм; повторное сложение накапливает высоту.', '«Предпросмотр» показывает результат, «Применить» меняет рельеф, «Сброс» возвращает настройки.'], ['F12 — открыть окно', 'Ctrl+Z — отмена'], 'Округлый лепесток: угол 45°, «Точная высота в мм» 2 мм, действие «Добавить» → «Применить». 3D отображается в масштабе XYZ 1:1.'), ('sweep', 'Вытягивание по двум направляющим', 'Создать рельеф вытягиванием одного или нескольких сечений вдоль двух направляющих; результат объединяется с рельефом.', ['Нарисуйте открытые векторы: верхнюю и нижнюю направляющие и одно или несколько сечений.', 'Нажмите «Верхняя направляющая — Выбор», затем один раз щёлкните открытый вектор в 2D. Окно вернётся автоматически; Enter не нужен.', 'Так же назначьте вторую направляющую, границу Z и сечения. Синяя линия — первая, оранжевая — вторая, фиолетовые — сечения; Esc отменяет выбор.', '«Развернуть направляющие» меняет направление, «Переход между сечениями» плавно смешивает сечения.', '«Масштабировать высоту по ширине», «Начальная высота» и «Масштабировать конечную высоту» задают высоту.', 'Выберите «Объединить» (добавить, вычесть, по наибольшему, по наименьшему) и нажмите «Вычислить».'], ['Рельефы → Вытягиваемые профили', 'Сечение идёт от первой точки вектора к последней, вверх — выше'], 'Одно сечение-арка даёт валик вдоль траектории; два сечения с переходом — валик, плавно меняющий форму.'), ('transform', 'Перемещение готового рельефа', 'Сдвинуть, повернуть, масштабировать, копировать, отразить выбранную часть рельефа.', ['Выделите замкнутый вектор.', 'Задайте сдвиг в мм, угол, масштаб.', '«Переместить» или «Копировать в новое место»; «Отразить» — по горизонтали или вертикали.', 'Флажок «вместе со связанными векторами» переносит и контуры.'], ['Ctrl+Z — отмена'], 'Скопируйте лепесток на другое место модели.'), ('contour', 'Векторы по высоте', 'Создать контур по границе заданного уровня рельефа.', ['Вкладка «Контуры по высоте».', 'Задайте уровень в мм (например 7 при высоте 10).', '«Построить контуры» — появятся обычные редактируемые векторы.'], ['—'], 'Уровень 7 мм при высоте 10 мм даёт линию по верхней части.'), ('light', 'Освещение и материалы', 'Менять вид модели светом; STL при этом не меняется.', ['Вкладка «Свет 3D»: материал, яркость, контраст.', 'Солнце: поворот и высота, значок, выключение.', 'Дополнительный свет можно отключить; «Тени» включает тени (медленнее).'], ['ЛКМ — вращать', 'Колесо — масштаб', 'Shift+ЛКМ — сдвиг'], 'Проверяйте рельеф при низком боковом свете — так его увидят на камне.'), ('files', 'Файлы, история и экспорт', 'Сохранение проекта, импорт DXF/SVG, экспорт SVG и STL в мм.', ['Ctrl+S — сохранить проект (фото, векторы, размеры, настройки, геометрия).', 'Ctrl+O — открыть.', 'Файл → Импорт DXF / SVG; Экспорт SVG, Экспорт STL.', 'Толщину основания можно менять в любой момент.'], ['Ctrl+Z / Ctrl+Y', 'F1 — эта книга'], 'Перед экспортом STL смотрите «Замкнутая модель: да».')]
 
 # ==================== interactive_tools ====================
 
@@ -5642,7 +5722,7 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
         super().__init__()
         self.setStyleSheet(STYLE)
         self.setWindowIcon(icon('dome', True))
-        self.setWindowTitle('Stone Relief Studio Pro 3.3 — векторы и рельеф')
+        self.setWindowTitle('Stone Relief Studio Pro 3.3.1 — векторы и рельеф')
         self.resize(1440, 940)
         self.sweep_dialog = self._build_sweep_dialog()
         self.relief_dialog = self._build_shape_dialog()
@@ -5709,6 +5789,9 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
             menus['Правка'].addAction(actions[key])
         for key in ('plate', 'fromphoto'):
             menus['Модель'].addAction(actions[key])
+        self.dimensions_action = QAction('РАЗМЕРЫ МОДЕЛИ', self)
+        self.dimensions_action.triggered.connect(lambda: self.model_dimensions_dialog())
+        menus['Модель'].addAction(self.dimensions_action)
         for key in ('text', 'svg', 'dxf', 'transform'):
             menus['Векторы'].addAction(actions[key])
         menus['Векторы'].addAction('Соединить два открытых вектора', self.join_selected)
@@ -5730,11 +5813,15 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
         self.help_button.setToolTip('Книга инструментов на русском · F1')
         self.help_button.clicked.connect(self.open_help)
         self.menuBar().setCornerWidget(self.help_button, Qt.TopRightCorner)
-        menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.3.'))
+        menus['Справка'].addAction('О программе', lambda: QMessageBox.information(self, 'Stone Relief Studio', 'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.3.1.'))
         filebar = self._toolbar('Проект и правка')
         for key in ('new', 'open', 'save', 'undo', 'redo', 'copy', 'delete', 'transform'):
             filebar.addAction(actions[key])
         filebar.addSeparator()
+        self.dimensions_button = QPushButton('РАЗМЕРЫ МОДЕЛИ')
+        self.dimensions_button.setProperty('primary', True)
+        self.dimensions_button.clicked.connect(lambda: self.model_dimensions_dialog())
+        filebar.addWidget(self.dimensions_button)
         brand = QLabel('  STONE  /  RELIEF STUDIO  ')
         brand.setStyleSheet('font-size: 15px; font-weight: 700; color:#466b64; padding:4px 12px;')
         filebar.addWidget(brand)
@@ -5809,7 +5896,7 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
         self.selection_info = QLabel('Выделите вектор — здесь появятся его размеры.')
         self.selection_info.setWordWrap(True)
         form.addRow(self.selection_info)
-        for label, widget in [('Ширина', self.sp_w), ('Высота', self.sp_h), ('Основание', self.sp_base), ('Высота из фото', self.sp_depth), ('Шаг рельефа', self.sp_step), ('Шаг привязки', self.sp_grid)]:
+        for label, widget in [('Ширина', self.sp_w), ('Высота', self.sp_h), ('Основание', self.sp_base), ('Высота рельефа / фото', self.sp_depth), ('Шаг рельефа', self.sp_step), ('Шаг привязки', self.sp_grid)]:
             form.addRow(label, widget)
             widget.show()
         self.stl_min_wall = self._spin(0.5, 0.05, 200, 3, ' мм', 0.1)
@@ -6189,7 +6276,7 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
         dialog.resize(560, 720)
         dialog.setModal(False)
         intro = dialog.findChildren(QLabel)[0]
-        intro.setText('1. Выберите две открытые направляющие.\n2. Добавьте поперечные сечения и задайте их положение.\n3. Проверьте поверхность в 3D и примените результат.')
+        intro.setText('1. Нажмите «Выбор», затем один раз щёлкните открытый вектор в 2D — Enter не нужен.\nПервая направляющая синяя, вторая оранжевая; сечения фиолетовые.\n2. Добавьте поперечные сечения и задайте их положение.\n3. Проверьте поверхность в 3D и примените результат.')
         for b in dialog.findChildren(QPushButton):
             if b.text() == 'Вычислить':
                 b.setText('Применить')
@@ -6247,6 +6334,7 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
         form = {}
         if hasattr(self, 'sh_kind'):
             form = dict(kind=self.sh_kind, angle=self.sh_angle.value(), start=self.sh_start.value(), scale=self.sh_scale_sl.value(), limit=self.sh_limit.value(), height=self.sh_scaleh.value(), const=self.sh_const.value(), height_mode=self.sh_height_mode()[0], combine=self.sh_mode_key())
+            form['exact'] = self.sh_exact.value()
         return dict(sweep=self.sweep_state(), form=form)
 
     def _restore_parameters(self, data, bind=True):
@@ -6269,11 +6357,11 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
         form = data.get('form', {})
         if form and hasattr(self, 'sh_kind'):
             self.sh_set_kind(int(form.get('kind', 0)))
-            for key, widget in [('angle', self.sh_angle), ('start', self.sh_start), ('scale', self.sh_scale_sl), ('limit', self.sh_limit), ('height', self.sh_scaleh), ('const', self.sh_const)]:
+            for key, widget in [('angle', self.sh_angle), ('start', self.sh_start), ('scale', self.sh_scale_sl), ('limit', self.sh_limit), ('height', self.sh_scaleh), ('const', self.sh_const), ('exact', self.sh_exact)]:
                 if key in form:
                     widget.setValue(form[key])
             mode = form.get('height_mode', 'free')
-            {'free': self.sh_r_free, 'limit': self.sh_r_limit, 'scale': self.sh_r_scale, 'const': self.sh_r_const}.get(mode, self.sh_r_free).setChecked(True)
+            {'exact': self.sh_r_exact, 'free': self.sh_r_free, 'limit': self.sh_r_limit, 'scale': self.sh_r_scale, 'const': self.sh_r_const}.get(mode, self.sh_r_free).setChecked(True)
             for (_, key), b in zip(self.SH_MODES, self.sh_mode_btns):
                 b.setChecked(key == form.get('combine', 'add'))
 
@@ -6300,7 +6388,7 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
 
     def snapshot(self):
         result = super().snapshot()
-        result.update(photo=(self.photo_pil, self.photo_bytes, self.photo_name), mesh=self.stl_mesh, dims=(self.sp_w.value(), self.sp_h.value(), self.sp_step.value()), selected=[v.data.uid for v in self.sel_vectors()], parameters=self._parameters())
+        result.update(photo=(self.photo_pil, self.photo_bytes, self.photo_name), mesh=self.stl_mesh, dims=(self.sp_w.value(), self.sp_h.value(), self.sp_step.value()), depth=self.sp_depth.value(), selected=[v.data.uid for v in self.sel_vectors()], parameters=self._parameters())
         return result
 
     def restore(self, state):
@@ -6308,6 +6396,9 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
             widget.blockSignals(True)
             widget.setValue(value)
             widget.blockSignals(False)
+        self.sp_depth.blockSignals(True)
+        self.sp_depth.setValue(state.get('depth', self.sp_depth.value()))
+        self.sp_depth.blockSignals(False)
         self.photo_pil, self.photo_bytes, self.photo_name = state.get('photo', (None, None, None))
         self.photo_arr = None
         self.stl_mesh = state.get('mesh')
@@ -6336,11 +6427,114 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
             return True
         return False
 
-    def new_project(self):
-        super().new_project()
-        if not self.has_content():
+    def model_dimensions_dialog(self, new_project=False):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Новый проект — размеры модели' if new_project else 'РАЗМЕРЫ МОДЕЛИ')
+        dialog.setSizeGripEnabled(True)
+        layout = QVBoxLayout(dialog)
+        note = QLabel('Все размеры в мм. X/Y масштабируют композицию; высота рельефа задаёт предел-предупреждение F12 и высоту из фото.\nСуществующий рельеф не обнуляется. Изменение основания сдвигает поверхность по Z, сохраняя рисунок.\nУвеличение шага сетки может уменьшить детализацию.')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        layout.addLayout(form)
+        fields = []
+        for label, original in [('Ширина X', self.sp_w), ('Высота Y', self.sp_h), ('Толщина основания', self.sp_base), ('Высота рельефа', self.sp_depth), ('Шаг сетки', self.sp_step)]:
+            widget = self._spin(original.value(), original.minimum(), original.maximum(), 6)
+            fields.append(widget)
+            form.addRow(label + ' (мм)', widget)
+        if self.stl_mesh is not None and (not new_project):
+            fields[2].setEnabled(False)
+            fields[2].setToolTip('Для произвольной сетки толщина основания не определяется одним числом. Используйте Mesh Edit.')
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        self.dimensions_dialog = dialog
+        self.dimensions_fields = fields
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        values = [field.value() for field in fields]
+        if new_project:
+            if not self.confirm_discard():
+                return False
+            self._clear_all()
+            self.project_path = None
+            self.setWindowTitle(APP)
             self.sw_reset()
             self._v_key = None
+        changed = self.apply_model_dimensions(*values, confirm=not new_project)
+        if new_project:
+            self.update_lock()
+            self.rebuild_canvas(force=True)
+            self._saved_sig = self.state_sig()
+        return changed
+
+    def apply_model_dimensions(self, width, height, base, depth, step, confirm=True):
+        """Resize the existing composition; preserve Z detail and history in mm."""
+        widgets = (self.sp_w, self.sp_h, self.sp_base, self.sp_depth, self.sp_step)
+        values = tuple((float(v) for v in (width, height, base, depth, step)))
+        if any((not math.isfinite(v) or not w.minimum() <= v <= w.maximum() for w, v in zip(widgets, values))):
+            raise ValueError('Размеры вне допустимых пределов. Проверьте значения в мм.')
+        old = tuple((w.value() for w in widgets))
+        if values == old:
+            return True
+        if self.stl_mesh is not None and base != old[2]:
+            raise ValueError('Основание произвольной сетки изменяется в Mesh Edit.')
+        if confirm and self.has_content():
+            answer = QMessageBox.question(self, 'Изменение размеров модели', f'Размер X/Y: {old[0]:g} × {old[1]:g} → {width:g} × {height:g} мм.\nОснование: {old[2]:g} → {base:g} мм; шаг: {old[4]:g} → {step:g} мм.\nКомпозиция будет масштабирована по X/Y; высоты рельефа сохранятся. При изменении шага сетка пересчитывается, возможна потеря мелких деталей.\nПродолжить? Ctrl+Z отменит операцию.', QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return False
+        self._sculpt_release()
+        self._irm_release()
+        self._irm_cancel(silent=True)
+        self.cancel_preview(silent=True)
+        snap = self.snapshot()
+        new_z = self.z
+        if new_z is not None:
+            if (width, height, step) != (old[0], old[1], old[4]):
+                from scipy.ndimage import zoom
+                nx, ny, used = grid_from_step(width, height, step)
+                new_z = zoom(new_z, (ny / new_z.shape[0], nx / new_z.shape[1]), order=1, prefilter=False)
+            new_z = new_z + base - old[2]
+            if float(new_z.min()) < 0.05:
+                QMessageBox.warning(self, 'Толщина основания', 'Изменение создаёт Z ниже 0,05 мм. Увеличьте основание; исходная модель сохранена.')
+                return False
+        new_mesh = self.stl_mesh
+        if new_mesh is not None:
+            new_mesh = new_mesh.copy()
+            vertices = np.array(new_mesh.vertices, dtype=float, copy=True)
+            origin = vertices[:, :2].min(axis=0)
+            vertices[:, :2] = origin + (vertices[:, :2] - origin) * [width / old[0], height / old[1]]
+            new_mesh.vertices = vertices
+        old_canvas = (self.canvas_w, self.canvas_h)
+        for widget, value in zip(widgets, values):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self._base_prev = base
+        self.z, self.stl_mesh = (new_z, new_mesh)
+        self.rebuild_canvas(force=True)
+        fx, fy = (self.canvas_w / old_canvas[0], self.canvas_h / old_canvas[1])
+        for vector in self.view.vectors():
+            vector.data.transform(lambda x, y: (x * fx, y * fy))
+            vector.refresh()
+        for point in self.view.ctrl_points():
+            point.setPos(point.pos().x() * fx, point.pos().y() * fy)
+        for point in self._irm_controls:
+            point['x'] *= width / old[0]
+            point['y'] *= height / old[1]
+            point['z'] += base - old[2]
+        self.push_history('Размеры модели (мм)', snap)
+        self.sw_refresh()
+        self.show_mesh(reset=True)
+        self.after_change()
+        self.update_rulers()
+        self._irm_refresh_list()
+        self.statusBar().showMessage(f'Модель {width:g} × {height:g} мм; основание {base:g} мм. Ctrl+Z — отменить.')
+        return True
+
+    def new_project(self):
+        return self.model_dimensions_dialog(new_project=True)
 
     def undo(self):
         self._sculpt_release()
@@ -6471,6 +6665,9 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
         self.show_mesh()
 
     def closeEvent(self, event):
+        if getattr(self, '_closed', False):
+            event.accept()
+            return
         self._sculpt_release()
         if not self.confirm_discard():
             event.ignore()
@@ -6481,6 +6678,11 @@ class StoneStudio(InteractiveManipulationMixin, Studio):
             self.settings.setValue(key + '/geometry', dialog.saveGeometry())
         self.settings.setValue('parameters', json.dumps(self._parameters(), ensure_ascii=False))
         self.settings.sync()
+        self.sh_timer.stop()
+        self._sculpt_timer.stop()
+        self.sweep_dialog.hide()
+        self.relief_dialog.hide()
+        self._closed = True
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         if self.book_dir:
             shutil.rmtree(self.book_dir, ignore_errors=True)

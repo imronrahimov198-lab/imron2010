@@ -136,7 +136,7 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         super().__init__()
         self.setStyleSheet(STYLE)
         self.setWindowIcon(icon('dome', True))
-        self.setWindowTitle('Stone Relief Studio Pro 3.3 — векторы и рельеф')
+        self.setWindowTitle('Stone Relief Studio Pro 3.3.1 — векторы и рельеф')
         self.resize(1440, 940)
         self.sweep_dialog = self._build_sweep_dialog()
         self.relief_dialog = self._build_shape_dialog()
@@ -229,6 +229,9 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
             menus['Правка'].addAction(actions[key])
         for key in ('plate','fromphoto'):
             menus['Модель'].addAction(actions[key])
+        self.dimensions_action = QAction('РАЗМЕРЫ МОДЕЛИ', self)
+        self.dimensions_action.triggered.connect(lambda: self.model_dimensions_dialog())
+        menus['Модель'].addAction(self.dimensions_action)
         for key in ('text','svg','dxf','transform'):
             menus['Векторы'].addAction(actions[key])
         menus['Векторы'].addAction('Соединить два открытых вектора', self.join_selected)
@@ -250,12 +253,16 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         self.help_button.clicked.connect(self.open_help)
         self.menuBar().setCornerWidget(self.help_button,Qt.TopRightCorner)
         menus['Справка'].addAction('О программе', lambda:QMessageBox.information(self, 'Stone Relief Studio',
-            'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.3.'))
+            'Векторное рисование и моделирование рельефа для камня.\nСамостоятельное оформление и значки.\nВерсия рабочего пространства 3.3.1.'))
 
         filebar = self._toolbar('Проект и правка')
         for key in ('new','open','save','undo','redo','copy','delete','transform'):
             filebar.addAction(actions[key])
         filebar.addSeparator()
+        self.dimensions_button = QPushButton('РАЗМЕРЫ МОДЕЛИ')
+        self.dimensions_button.setProperty('primary', True)
+        self.dimensions_button.clicked.connect(lambda: self.model_dimensions_dialog())
+        filebar.addWidget(self.dimensions_button)
         brand = QLabel('  STONE  /  RELIEF STUDIO  ')
         brand.setStyleSheet('font-size: 15px; font-weight: 700; color:#466b64; padding:4px 12px;')
         filebar.addWidget(brand)
@@ -334,7 +341,7 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         self.selection_info.setWordWrap(True)
         form.addRow(self.selection_info)
         for label,widget in [('Ширина',self.sp_w),('Высота',self.sp_h),('Основание',self.sp_base),
-                             ('Высота из фото',self.sp_depth),('Шаг рельефа',self.sp_step),('Шаг привязки',self.sp_grid)]:
+                             ('Высота рельефа / фото',self.sp_depth),('Шаг рельефа',self.sp_step),('Шаг привязки',self.sp_grid)]:
             form.addRow(label,widget)
             widget.show()
         self.stl_min_wall=self._spin(.5,.05,200,3,' мм',.1)
@@ -660,7 +667,9 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         dialog.setSizeGripEnabled(True); dialog.resize(560,720)
         dialog.setModal(False)
         intro=dialog.findChildren(QLabel)[0]
-        intro.setText('1. Выберите две открытые направляющие.\n2. Добавьте поперечные сечения и задайте их положение.\n3. Проверьте поверхность в 3D и примените результат.')
+        intro.setText('1. Нажмите «Выбор», затем один раз щёлкните открытый вектор в 2D — Enter не нужен.\n'
+                      'Первая направляющая синяя, вторая оранжевая; сечения фиолетовые.\n'
+                      '2. Добавьте поперечные сечения и задайте их положение.\n3. Проверьте поверхность в 3D и примените результат.')
         for b in dialog.findChildren(QPushButton):
             if b.text()=='Вычислить': b.setText('Применить'); b.setProperty('primary',True)
             if b.text().startswith('Положение выбранного'): b.setText('Положение сечения вдоль кривых, %')
@@ -712,6 +721,7 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
             form=dict(kind=self.sh_kind,angle=self.sh_angle.value(),start=self.sh_start.value(),
                       scale=self.sh_scale_sl.value(),limit=self.sh_limit.value(),height=self.sh_scaleh.value(),
                       const=self.sh_const.value(),height_mode=self.sh_height_mode()[0],combine=self.sh_mode_key())
+            form['exact'] = self.sh_exact.value()
         return dict(sweep=self.sweep_state(),form=form)
 
     def _restore_parameters(self, data, bind=True):
@@ -732,10 +742,10 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         if form and hasattr(self,'sh_kind'):
             self.sh_set_kind(int(form.get('kind',0)))
             for key,widget in [('angle',self.sh_angle),('start',self.sh_start),('scale',self.sh_scale_sl),
-                               ('limit',self.sh_limit),('height',self.sh_scaleh),('const',self.sh_const)]:
+                               ('limit',self.sh_limit),('height',self.sh_scaleh),('const',self.sh_const),('exact',self.sh_exact)]:
                 if key in form: widget.setValue(form[key])
             mode=form.get('height_mode','free')
-            {'free':self.sh_r_free,'limit':self.sh_r_limit,'scale':self.sh_r_scale,'const':self.sh_r_const}.get(mode,self.sh_r_free).setChecked(True)
+            {'exact':self.sh_r_exact,'free':self.sh_r_free,'limit':self.sh_r_limit,'scale':self.sh_r_scale,'const':self.sh_r_const}.get(mode,self.sh_r_free).setChecked(True)
             for (_,key),b in zip(self.SH_MODES,self.sh_mode_btns): b.setChecked(key==form.get('combine','add'))
 
     def _settings(self):
@@ -764,12 +774,16 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         result=super().snapshot()
         result.update(photo=(self.photo_pil,self.photo_bytes,self.photo_name),mesh=self.stl_mesh,
                       dims=(self.sp_w.value(),self.sp_h.value(),self.sp_step.value()),
+                      depth=self.sp_depth.value(),
                       selected=[v.data.uid for v in self.sel_vectors()],parameters=self._parameters())
         return result
 
     def restore(self, state):
         for widget,value in zip((self.sp_w,self.sp_h,self.sp_step),state.get('dims',())):
             widget.blockSignals(True); widget.setValue(value); widget.blockSignals(False)
+        self.sp_depth.blockSignals(True)
+        self.sp_depth.setValue(state.get('depth', self.sp_depth.value()))
+        self.sp_depth.blockSignals(False)
         self.photo_pil,self.photo_bytes,self.photo_name=state.get('photo',(None,None,None))
         self.photo_arr=None; self.stl_mesh=state.get('mesh')
         super().restore(state)
@@ -795,10 +809,106 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
             return True
         return False
 
+    def model_dimensions_dialog(self, new_project=False):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Новый проект — размеры модели' if new_project else 'РАЗМЕРЫ МОДЕЛИ')
+        dialog.setSizeGripEnabled(True)
+        layout = QVBoxLayout(dialog)
+        note = QLabel('Все размеры в мм. X/Y масштабируют композицию; высота рельефа задаёт предел-предупреждение F12 и высоту из фото.\n'
+                      'Существующий рельеф не обнуляется. Изменение основания сдвигает поверхность по Z, сохраняя рисунок.\n'
+                      'Увеличение шага сетки может уменьшить детализацию.')
+        note.setWordWrap(True); layout.addWidget(note)
+        form = QFormLayout(); layout.addLayout(form)
+        fields = []
+        for label, original in [('Ширина X',self.sp_w),('Высота Y',self.sp_h),('Толщина основания',self.sp_base),
+                                ('Высота рельефа',self.sp_depth),('Шаг сетки',self.sp_step)]:
+            widget = self._spin(original.value(), original.minimum(), original.maximum(), 6)
+            fields.append(widget); form.addRow(label + ' (мм)', widget)
+        if self.stl_mesh is not None and not new_project:
+            fields[2].setEnabled(False)
+            fields[2].setToolTip('Для произвольной сетки толщина основания не определяется одним числом. Используйте Mesh Edit.')
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        self.dimensions_dialog = dialog
+        self.dimensions_fields = fields
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        values = [field.value() for field in fields]
+        if new_project:
+            # Confirm/Save while the old project is intact; Cancel preserves it.
+            if not self.confirm_discard():
+                return False
+            self._clear_all(); self.project_path = None
+            self.setWindowTitle(core.APP)
+            self.sw_reset(); self._v_key = None
+        changed = self.apply_model_dimensions(*values, confirm=not new_project)
+        if new_project:
+            self.update_lock(); self.rebuild_canvas(force=True)
+            self._saved_sig = self.state_sig()
+        return changed
+
+    def apply_model_dimensions(self, width, height, base, depth, step, confirm=True):
+        """Resize the existing composition; preserve Z detail and history in mm."""
+        widgets = (self.sp_w,self.sp_h,self.sp_base,self.sp_depth,self.sp_step)
+        values = tuple(float(v) for v in (width,height,base,depth,step))
+        if any(not math.isfinite(v) or not w.minimum() <= v <= w.maximum() for w,v in zip(widgets,values)):
+            raise ValueError('Размеры вне допустимых пределов. Проверьте значения в мм.')
+        old = tuple(w.value() for w in widgets)
+        if values == old:
+            return True
+        if self.stl_mesh is not None and base != old[2]:
+            raise ValueError('Основание произвольной сетки изменяется в Mesh Edit.')
+        if confirm and self.has_content():
+            answer = QMessageBox.question(self, 'Изменение размеров модели',
+                f'Размер X/Y: {old[0]:g} × {old[1]:g} → {width:g} × {height:g} мм.\n'
+                f'Основание: {old[2]:g} → {base:g} мм; шаг: {old[4]:g} → {step:g} мм.\n'
+                'Композиция будет масштабирована по X/Y; высоты рельефа сохранятся. '
+                'При изменении шага сетка пересчитывается, возможна потеря мелких деталей.\nПродолжить? Ctrl+Z отменит операцию.',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return False
+        self._sculpt_release(); self._irm_release(); self._irm_cancel(silent=True)
+        self.cancel_preview(silent=True)
+        snap = self.snapshot()
+        new_z = self.z
+        if new_z is not None:
+            if (width,height,step) != (old[0],old[1],old[4]):
+                from scipy.ndimage import zoom
+                nx,ny,used = core.grid_from_step(width,height,step)
+                new_z = zoom(new_z, (ny/new_z.shape[0],nx/new_z.shape[1]), order=1, prefilter=False)
+            new_z = new_z + base-old[2]
+            if float(new_z.min()) < .05:
+                QMessageBox.warning(self,'Толщина основания','Изменение создаёт Z ниже 0,05 мм. Увеличьте основание; исходная модель сохранена.')
+                return False
+        new_mesh = self.stl_mesh
+        if new_mesh is not None:
+            new_mesh = new_mesh.copy()
+            vertices = np.array(new_mesh.vertices, dtype=float, copy=True)
+            origin = vertices[:,:2].min(axis=0)
+            vertices[:,:2] = origin + (vertices[:,:2]-origin)*[width/old[0],height/old[1]]
+            new_mesh.vertices = vertices
+        old_canvas = (self.canvas_w,self.canvas_h)
+        for widget,value in zip(widgets,values):
+            widget.blockSignals(True); widget.setValue(value); widget.blockSignals(False)
+        self._base_prev = base
+        self.z, self.stl_mesh = new_z,new_mesh
+        self.rebuild_canvas(force=True)
+        fx,fy = self.canvas_w/old_canvas[0],self.canvas_h/old_canvas[1]
+        for vector in self.view.vectors():
+            vector.data.transform(lambda x,y:(x*fx,y*fy)); vector.refresh()
+        for point in self.view.ctrl_points():
+            point.setPos(point.pos().x()*fx,point.pos().y()*fy)
+        for point in self._irm_controls:
+            point['x'] *= width/old[0]; point['y'] *= height/old[1]; point['z'] += base-old[2]
+        self.push_history('Размеры модели (мм)',snap)
+        self.sw_refresh(); self.show_mesh(reset=True)
+        self.after_change(); self.update_rulers(); self._irm_refresh_list()
+        self.statusBar().showMessage(f'Модель {width:g} × {height:g} мм; основание {base:g} мм. Ctrl+Z — отменить.')
+        return True
+
     def new_project(self):
-        super().new_project()
-        if not self.has_content():
-            self.sw_reset(); self._v_key=None
+        return self.model_dimensions_dialog(new_project=True)
 
     def undo(self):
         self._sculpt_release()
@@ -903,12 +1013,17 @@ class StoneStudio(InteractiveManipulationMixin, core.Studio):
         self.show_mesh()
 
     def closeEvent(self,event):
+        if getattr(self,'_closed',False):
+            event.accept(); return
         self._sculpt_release()
         if not self.confirm_discard(): event.ignore(); return
         self.settings.setValue('geometry',self.saveGeometry()); self.settings.setValue('dockState',self.saveState())
         for key,dialog in [('sweep',self.sweep_dialog),('shape',self.relief_dialog)]:
             self.settings.setValue(key+'/geometry',dialog.saveGeometry())
         self.settings.setValue('parameters',json.dumps(self._parameters(),ensure_ascii=False)); self.settings.sync()
+        self.sh_timer.stop(); self._sculpt_timer.stop()
+        self.sweep_dialog.hide(); self.relief_dialog.hide()
+        self._closed=True
         core.shutil.rmtree(self.tmpdir,ignore_errors=True)
         if self.book_dir: core.shutil.rmtree(self.book_dir,ignore_errors=True)
         self.plotter.close(); event.accept()

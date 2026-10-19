@@ -109,15 +109,15 @@ def validate_project_payload(meta, arrays):
     if sweep.get('mode', 'add') not in ('add', 'sub', 'high', 'low'):
         raise ValueError('Неизвестный режим объединения сечений.')
     form_ranges = dict(angle=(-90,90), scale=(1,50), kind=(0,2), start=(-500,500),
-                       limit=(0,500), height=(0,500), const=(-500,500))
+                       limit=(0,500), height=(0,500), exact=(0,500), const=(-500,500))
     for key, bounds in form_ranges.items():
         if key in form:
             _project_number(form[key], key, *bounds, integer=key in ('angle', 'scale', 'kind'))
     if form.get('kind', 0) not in (0, 1, 2):
         raise ValueError('Неизвестная форма F12.')
-    if form.get('height_mode', 'free') not in ('free', 'limit', 'scale', 'const'):
+    if form.get('height_mode', 'free') not in ('free', 'limit', 'scale', 'const', 'exact'):
         raise ValueError('Неизвестный режим высоты F12.')
-    if form.get('combine', 'add') not in ('add', 'sub', 'high', 'low', 'zero_in', 'zero_out'):
+    if form.get('combine', 'add') not in ('add', 'sub', 'high', 'low', 'zero_in', 'zero_out', 'replace'):
         raise ValueError('Неизвестный режим объединения F12.')
     if set(arrays) - {'z', 'mesh_vertices', 'mesh_faces'}:
         raise ValueError('Неизвестные данные геометрии проекта.')

@@ -30,7 +30,7 @@ def build(output):
     root = Path(__file__).resolve().parent
     header = '''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Stone Relief Studio — редактор векторов и рельефов, версия 3.3.
+"""Stone Relief Studio — редактор векторов и рельефов, версия 3.3.1.
 
 Вся программа находится в этом файле. Другие файлы исходного кода не нужны.
 Запуск: python stone_relief_studio_fixed.py
@@ -38,6 +38,9 @@ def build(output):
 python -m pip install PySide6 numpy Pillow scipy trimesh pyvista pyvistaqt qtpy ezdxf rtree svgelements shapely "vtk>=9.5,<9.6"
 
 Рабочий этап Pro 3.3: аудит, Interactive Relief Manipulation и Mesh Edit.
+Исправления 3.3.1: размеры модели с сохранением рельефа, направляющие
+одним щелчком, точная высота F12 в мм и отчёт реальных Z до/после.
+Точная высота не умножается на геометрический масштаб; 3D XYZ = 1:1.
 Существующие Studio, F12, две направляющие, векторы и «Лепка в 3D» сохранены.
 Контрольные точки: Z в мм, закрепление, Local/Full Surface, маска и края,
 фоновый предпросмотр, применение одной операцией Undo/Redo.
